@@ -1,7 +1,7 @@
 ---
 name: pyslang
 description: This skill should be used when writing Python scripts that parse, analyze, or extract information from SystemVerilog files using the pyslang library. Covers CST (syntax tree), AST (elaborated symbol tree), type resolution, port/variable extraction, and source location mapping. Triggers on phrases like "pyslang", "用pyslang", "扫描SV", "提取端口", "SystemVerilog解析", "slang python", or when working with .sv file analysis tools.
-version: 1.0.0
+version: 1.1.0
 ---
 
 # pyslang API Reference & Coding Guide
@@ -72,6 +72,9 @@ SK.StructType, SK.EnumType, SK.UnionType
 SK.CHandleType, SK.VirtualInterfaceType
 SK.ImplicitType, SK.NamedType
 SK.SequenceType, SK.PropertyType
+
+# 模块实例化
+SK.HierarchyInstantiation      # 模块实例化语句（如 adder_8bit u_adder(...)）
 ```
 
 ### 2.3 Token 与 TokenKind
@@ -167,6 +170,11 @@ elif port_header.kind == SK.VariablePortHeader:
 
 # GenvarDeclaration:
 #   有 identifiers 列表，每个 ident.identifier.valueText (genvar 名)
+
+# HierarchyInstantiation (模块实例化):
+#   有 instances 列表，每个 inst 是 InstanceNameSyntax
+#   实例名通过 inst.name.valueText 获取（字符串）
+#   端口连接通过 member.instances 对应的 AST InstanceSymbol.portConnections 获取
 ```
 
 ---
@@ -182,8 +190,15 @@ comp = ast.Compilation()
 comp.addSyntaxTree(tree)
 root = comp.getRoot()  # RootSymbol
 
-# 诊断
+# 编译诊断
 diags = comp.getAllDiagnostics()  # list[Diagnostic]
+for d in diags:
+    d.code       # DiagCode 枚举值（如 DiagCode(ArithOpMismatch)）
+    d.isError()  # bool: 是否为错误（注意：是方法不是属性！）
+    d.args       # list: 诊断参数（如类型名）
+    d.location   # SourceLocation: 关联位置
+    d.ranges     # list[SourceRange]: 关联源码范围
+    d.symbol     # Symbol: 关联的符号
 ```
 
 ### 3.2 顶层实例与模块查找
@@ -233,6 +248,10 @@ SK.DefParam        # defparam
 SK.ScalarType      # 标量类型
 SK.PackedArrayType # 打包数组类型
 SK.Definition      # 定义符号
+SK.UninstantiatedDef # 未实例化的定义（缺少子模块定义时出现）
+SK.ContinuousAssign  # 连续赋值 (assign)
+SK.ProceduralBlock   # 过程块 (always_comb, always_ff, etc.)
+SK.Subroutine        # 子例程 (function, task)
 ```
 
 ### 3.4 PortSymbol（端口）
@@ -301,18 +320,146 @@ if sym:
     sym.location    # SourceLocation (用于取行号)
 ```
 
-### 3.8 行号 / 源位置
+### 3.8 SourceManager / 源位置映射
 
 ```python
 sm = comp.sourceManager  # SourceManager
 
 sym = body.find("foo")
 if sym and sym.location:
-    line   = sm.getLineNumber(sym.location)    # int
-    column = sm.getColumnNumber(sym.location)  # int
+    line   = sm.getLineNumber(sym.location)    # int: 行号
+    column = sm.getColumnNumber(sym.location)  # int: 列号
+
+# 获取文件路径（两种方式）：
+#   方式 1: getFileName(location) → 相对路径字符串
+rel_path = sm.getFileName(sym.location)  # 如 "test/with_instance/alu_system.sv"
+
+#   方式 2: getFullPath(buffer_id) → 绝对路径 pathlib.Path
+#   注意: getFullPath 接受 BufferID，不是 SourceLocation！需要用 location.buffer
+abs_path = str(sm.getFullPath(sym.location.buffer))  # 如 "/home/.../alu_system.sv"
+
+# 区分两个位置概念：
+#   inst.location             → 实例化位置（在父模块中，指向父模块文件）
+#   inst.definition.location  → 模块定义位置（指向模块自身的文件）
 ```
 
 注意：`SourceLocation` 本身只有 `buffer` 和 `offset` 属性，没有 `line` / `column`。必须通过 `SourceManager` 映射。
+
+### 3.9 InstanceSymbol（实例化模块）与层次遍历
+
+`InstanceSymbol` 表示一个模块实例（如 `u_adder`），是层次遍历的核心节点。**前提**：必须将所有 SV 文件一起编译，否则子模块会退化为 `UninstantiatedDefSymbol`（缺少定义）。
+
+#### 3.9.1 核心属性
+
+```python
+inst = root.topInstances[0]
+
+# 实例与模块
+inst.name                 # str: 实例名（如 "u_core"）
+inst.definition.name      # str: 模块类型名（如 "alu_core"），注意不是 inst.name!
+inst.hierarchicalPath     # str: 完整层次路径（如 "alu_system.u_core.u_adder"）
+                          # 顶层为模块名，后续层级均为实例名
+
+# 位置信息
+inst.location             # SourceLocation: 实例化位置（指向父模块文件）
+inst.definition.location  # SourceLocation: 模块定义位置（指向模块自身文件）
+
+# 类型标志
+inst.isModule             # bool: 是否为模块实例
+inst.isInterface          # bool: 是否为接口实例
+
+# AST 体访问
+inst.body                 # InstanceBodySymbol: 实例体（含 portList, find() 等）
+inst.body.syntax          # ModuleDeclarationSyntax: CST 节点（含 members 遍历）
+
+# 端口连接
+inst.portConnections      # list[PortConnection]: 实例的端口连接
+# PortConnection 属性:
+#   conn.port       → PortSymbol: 被连接的端口
+#   conn.expression → Expression: 连接到的表达式
+#   conn.ifaceConn  → 接口连接（若为接口端口）
+```
+
+#### 3.9.2 visit() 递归遍历
+
+所有 Symbol 子类都有 `visit(callback)` 方法，以深度优先遍历整个符号子树。**注意**：visit 会遍历**所有**符号节点（含表达式、语句等），很多节点没有 `name` 属性，callback 需先检查。
+
+```python
+instances = []
+
+def collect_instances(sym):
+    """收集所有 InstanceSymbol（只过滤 SymbolKind.Instance）"""
+    if sym.kind == ast.SymbolKind.Instance:
+        instances.append(sym)
+
+# 对每个顶层实例启动遍历
+for top_inst in root.topInstances:
+    top_inst.visit(collect_instances)
+
+# instances 现在包含所有层次中的所有实例（DFS 前序）
+# 每个 InstanceSymbol 的 hierarchicalPath 自动正确
+```
+
+**为什么不用 `body.syntax.members` 手动递归？**
+- CST 遍历需要递归打开每个子模块的文件 → 手动管理 Compilation
+- `visit()` 在 elaboration 后的 AST 上运行，pyslang 自动解析所有子模块
+- `hierarchicalPath` 自动提供正确格式的路径
+
+#### 3.9.3 额外属性
+
+```python
+# 数组实例
+inst.arrayName            # 数组名（若为数组实例）
+inst.arrayPath            # 数组路径
+
+# 查找端口连接
+inst.getPortConnection(port_name)  # 按名称查找端口连接
+inst.canonicalBody         # 规范体（参数化展开后）
+
+# 父级关系
+inst.parentScope           # 父作用域
+inst.declaredType          # 声明类型（通常为 None，用 definition.name）
+inst.declaringDefinition   # 声明定义
+```
+
+### 3.10 DefinitionSymbol（模块定义）
+
+```python
+defn = inst.definition  # DefinitionSymbol
+
+defn.name                # str: 模块名（如 "adder_8bit"）
+defn.kind                # SymbolKind.Definition
+defn.location            # SourceLocation: 定义位置
+defn.definitionKind      # 定义种类
+defn.defaultLifetime     # 默认生命周期
+defn.defaultNetType      # 默认网络类型
+defn.timeScale           # 时间刻度
+defn.unconnectedDrive    # 未连接驱动行为
+defn.instanceCount       # int: 被实例化的次数
+defn.cellDefine          # bool: 是否为 cell define
+defn.syntax              # CST 节点
+
+# 注意：DefinitionSymbol 没有 body 属性！
+# 要访问 InstanceBodySymbol 请使用 InstanceSymbol.body
+```
+
+### 3.11 InstanceBodySymbol 补充属性
+
+```python
+body = inst.body  # InstanceBodySymbol
+
+# 除了已记录的 portList, find(), findPort(), syntax:
+body.containingInstance   # InstanceSymbol: 包含此体的实例
+body.parentInstance       # InstanceSymbol: 父实例
+body.lookupName(name)     # 按名称查找子符号
+body.parameters           # list: 参数列表
+body.defaultNetType       # 默认网络类型
+body.timeScale            # 时间刻度
+body.isUninstantiated     # bool: 是否未被实例化
+body.isProceduralContext  # bool: 是否为过程上下文
+body.compilationUnit      # 编译单元
+body.definition           # DefinitionSymbol: 回到模块定义
+```
 
 ---
 
@@ -348,7 +495,58 @@ for member in body.syntax.members:
                 # str(sym.type), sym.type.bitWidth
 ```
 
-### 4.3 禁止的写法
+### 4.3 层次遍历（visit 收集 + 输出组装）
+
+```python
+# 提取完整实例化层次，输出 {层次路径: {module, file, ast, ports}}
+def extract_hierarchy(sv_files):
+    # 步骤 1: 编译所有文件（必须全部编译！）
+    comp = ast.Compilation()
+    for f in sv_files:
+        comp.addSyntaxTree(syntax.SyntaxTree.fromFile(f))
+    root = comp.getRoot()
+    sm = comp.sourceManager
+
+    # 步骤 2: visit() 收集所有 InstanceSymbol
+    instances = []
+    def collect(sym):
+        if sym.kind == ast.SymbolKind.Instance:
+            instances.append(sym)
+    for top_inst in root.topInstances:
+        top_inst.visit(collect)
+
+    # 步骤 3: 遍历实例列表，组装输出 dict
+    result = {}
+    for inst in instances:
+        # 文件路径：用 definition.location → 指向模块定义文件
+        file_path = str(sm.getFullPath(inst.definition.location.buffer))
+        
+        # 端口提取
+        ports = []
+        for port in inst.body.portList:
+            ports.append({
+                'name': port.name,
+                'direction': DIRECTION_MAP.get(port.direction, str(port.direction)),
+                'width': port.type.bitWidth if port.type and hasattr(port.type, 'bitWidth') else 0,
+            })
+        
+        result[inst.hierarchicalPath] = {
+            'module': inst.definition.name,
+            'file': file_path,
+            'ast': inst.body,        # InstanceBodySymbol，供后续解析使用
+            'ports': ports,
+        }
+
+    return result
+```
+
+**关键点**：
+- `inst.hierarchicalPath` 自动满足路径格式要求（顶层模块名 + 下级实例名）
+- `inst.location` ≠ `inst.definition.location`：前者指向实例化位置（父文件），后者指向模块定义位置（自身文件）
+- `inst.definition.name`（模块类型名）≠ `inst.name`（实例名）
+- `DefinitionSymbol` 没有 `body` 属性，必须通过 `InstanceSymbol.body` 访问 `InstanceBodySymbol`
+
+### 4.4 禁止的写法
 
 - `str(kind) == "SyntaxKind.XXX"` → 用 `kind == SK.XXX` 枚举比较
 - `'Input' in str(kind)` → 用 `kind == TK.InputKeyword` 枚举比较  
@@ -356,6 +554,8 @@ for member in body.syntax.members:
 - `getattr(SK, 'WireType')` → WireType 不存在！Net 类型在 AST 中被推导为 logic
 - `ast.SymbolKind.EnumMember` → 不存在！应为 `ast.SymbolKind.EnumValue`
 - `data_type_node.getBitstreamWidth()` → 不存在！用 `bitWidth` 属性
+- `inst.definition.body` → 不存在！`DefinitionSymbol` 没有 `body` 属性，用 `inst.body` 获取 `InstanceBodySymbol`
+- `inst.location` 获取文件路径 → 用 `inst.definition.location`！前者指向父模块的实例化位置，后者才指向模块定义文件
 
 ---
 
@@ -375,10 +575,25 @@ for member in body.syntax.members:
 - `GenvarDeclarationSyntax.declarator` — 不存在，用 `.identifiers` 列表
 - `VariablePortHeaderSyntax.varKeyword` — 可能不存在
 
+### 已确认需要区分的 API
+
+- `inst.location` vs `inst.definition.location` — 前者是实例化位置（在父模块文件中），后者是模块定义位置（在模块自身文件中），获取文件路径时用后者
+- `sm.getFileName(location)` vs `sm.getFullPath(buffer_id)` — 前者返回相对路径字符串，后者返回绝对路径 `pathlib.Path`；`getFullPath` 接受 `BufferID` 而非 `SourceLocation`，需用 `location.buffer` 传参
+- `inst.name` vs `inst.definition.name` — 前者是实例名（如 `"u_adder"`），后者是模块类型名（如 `"adder_8bit"`）
+- `DefinitionSymbol` 没有 `body` 属性 — 必须通过 `InstanceSymbol.body` 访问 `InstanceBodySymbol`
+- `Diagnostic.isError()` — 是**方法**不是属性，需要加 `()` 调用
+- `hierarchicalPath` — `InstanceSymbol` 和 `InstanceBodySymbol` 都有此属性，格式为 `"topModule.childInst.grandchildInst"`
+
+### 已确认的运行时行为
+
+- **缺少子模块定义** — 若未将所有 SV 文件加入 `Compilation`，子模块实例在 AST 中表现为 `UninstantiatedDefSymbol` 而非 `InstanceSymbol`，`visit()` 仍会遍历到它们但 `kind` 不同。层次遍历**必须一次性编译所有源文件**。
+- **visit() 遍历范围** — `visit(callback)` 会遍历所有类型的符号节点（含表达式、语句等），callback 必须用 `sym.kind` 过滤目标类型，不可假设所有节点都有 `name` 属性。
+
 ---
 
 ## 6. 更新日志
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.1.0 | 2026-07-26 | 新增：InstanceSymbol 层次遍历（3.9）、DefinitionSymbol（3.10）、InstanceBodySymbol 补充属性（3.11）、层次遍历编码模式（4.3）；新增 SyntaxKind.HierarchyInstantiation（2.2）、CST 实例化节点结构（2.7）；新增 SymbolKind（UninstantiatedDef/ContinuousAssign/ProceduralBlock/Subroutine）；补充 SourceManager.getFileName/getFullPath 区分（3.8）；补充 Diagnostic 结构（3.1）；新增「已确认需要区分的 API」和「运行时行为」纠正项（5） |
 | 1.0.0 | 2026-07-26 | 初始版本，覆盖 CST/AST 核心 API、端口扫描、变量扫描、源位置映射 |
