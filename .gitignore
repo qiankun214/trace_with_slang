@@ -1,0 +1,24 @@
+# Python virtual environment
+venv/
+
+# Python compiled bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Compiled shared objects
+*.so
+
+# Compiled Verilog simulation output
+*.vvp
+*.vcd
+*.lxt
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
