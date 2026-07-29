@@ -96,8 +96,13 @@ def trace_variable(filelist_path, var_path):
         driving_inst = _find_driving_instance(body, var_name, target_ci)
         if driving_inst is not None:
             source_info = _get_hierarchy_instantiation_source(driving_inst, sm)
-            output_symbols = _collect_output_port_variables(driving_inst)
+            output_symbols = _collect_output_port_variables(driving_inst, var_name)
             return _build_port_result(var_info, source_info, output_symbols)
+        # 输入端口：变量由父模块的实例端口连接驱动
+        input_info = _find_input_port_connection(body, var_name)
+        if input_info is not None:
+            source_info = _get_hierarchy_instantiation_source(input_info['instance_ast'], sm)
+            return _build_port_result(var_info, source_info, [input_info['driving_symbol']])
         raise RuntimeError(
             f"变量 '{var_name}' 在 '{inst_path}' 中未找到 always 块或 assign 赋值"
         )
@@ -425,18 +430,18 @@ def _get_hierarchy_instantiation_source(inst_ast, sm):
     }
 
 
-def _collect_output_port_variables(inst_ast):
+def _collect_output_port_variables(inst_ast, var_name):
     """
-    收集实例所有输出端口连接的变量。
+    收集驱动目标变量的子模块输出端口。
 
-    遍历 portConnections，筛选 direction == Out 的端口，
-    从连接表达式（ExpressionKind.Assignment）的 .left 提取被驱动的变量。
+    只返回连接表达式中包含 var_name 的输出端口变量，不返回实例的全部输出端口。
 
     Args:
         inst_ast: InstanceSymbol
+        var_name: 目标变量名（用于过滤端口连接）
 
     Returns:
-        list[Symbol]: 输出端口连接的 AST Symbol 列表（可直接传给 _build_variable_info）
+        list[Symbol]: 驱动目标变量的端口 AST Symbol 列表
     """
     output_symbols = []
 
@@ -445,19 +450,83 @@ def _collect_output_port_variables(inst_ast):
         if port is None or port.direction != ast.ArgumentDirection.Out:
             continue
 
+        # 检查连接表达式是否包含目标变量
         expr = conn.expression if hasattr(conn, 'expression') else None
         if expr is None:
             continue
 
-        # 输出端口连接表达式是 Assignment，.left 为被驱动的变量
-        if expr.kind == ast.ExpressionKind.Assignment:
+        matches = False
+        if expr.kind == ast.ExpressionKind.NamedValue:
+            s = expr.symbol if hasattr(expr, 'symbol') else None
+            if s is not None and s.name == var_name:
+                matches = True
+        elif expr.kind == ast.ExpressionKind.Assignment:
             left = expr.left if hasattr(expr, 'left') else None
             if left is not None and left.kind == ast.ExpressionKind.NamedValue:
                 s = left.symbol if hasattr(left, 'symbol') else None
-                if s is not None:
-                    output_symbols.append(s)
+                if s is not None and s.name == var_name:
+                    matches = True
+
+        if matches:
+            port_sym = inst_ast.body.find(port.name)
+            if port_sym is not None:
+                output_symbols.append(port_sym)
 
     return output_symbols
+
+
+def _find_input_port_connection(body, var_name):
+    """
+    检查变量是否为输入端口，若是则返回父模块中驱动该端口的信号。
+
+    输入端口的值来自父模块实例化时的端口连接。通过 body.portList 确认
+    端口方向为 In，再从 body.containingInstance.portConnections 获取
+    连接表达式中的驱动信号。
+
+    Args:
+        body:     InstanceBodySymbol（目标变量所在模块的 AST 体）
+        var_name: 目标变量名
+
+    Returns:
+        dict 或 None: {'instance_ast': InstanceSymbol, 'driving_symbol': Symbol}
+    """
+    # 1. 确认是输入端口
+    is_input_port = False
+    for port in body.portList:
+        if port.name == var_name and port.direction == ast.ArgumentDirection.In:
+            is_input_port = True
+            break
+
+    if not is_input_port:
+        return None
+
+    # 2. 从当前实例的端口连接中找驱动信号
+    current_inst = body.containingInstance  # InstanceBodySymbol
+    if current_inst is None:
+        return None
+    # InstanceBodySymbol.parentInstance → InstanceSymbol（含 portConnections）
+    inst_sym = current_inst.parentInstance
+    if inst_sym is None:
+        return None
+
+    for conn in inst_sym.portConnections:
+        if conn.port is None or conn.port.name != var_name:
+            continue
+
+        expr = conn.expression if hasattr(conn, 'expression') else None
+        if expr is None:
+            continue
+
+        # 输入端口连接表达式是 NamedValue（如 core_carry）
+        if expr.kind == ast.ExpressionKind.NamedValue:
+            driving_sym = expr.symbol if hasattr(expr, 'symbol') else None
+            if driving_sym is not None:
+                return {
+                    'instance_ast': inst_sym,
+                    'driving_symbol': driving_sym,
+                }
+
+    return None
 
 
 # ==============================================================================
