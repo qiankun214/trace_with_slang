@@ -1,7 +1,7 @@
 ---
 name: pyslang
 description: This skill should be used when writing Python scripts that parse, analyze, or extract information from SystemVerilog files using the pyslang library. Covers CST (syntax tree), AST (elaborated symbol tree), type resolution, port/variable extraction, and source location mapping. Triggers on phrases like "pyslang", "用pyslang", "扫描SV", "提取端口", "SystemVerilog解析", "slang python", or when working with .sv file analysis tools.
-version: 1.1.0
+version: 1.2.0
 ---
 
 # pyslang API Reference & Coding Guide
@@ -201,6 +201,21 @@ for d in diags:
     d.symbol     # Symbol: 关联的符号
 ```
 
+### 3.1.1 Elaboration 做了什么（为什么 visit() 能递归找到所有嵌套实例）
+
+pyslang 的 elaboration 阶段（`comp.getRoot()` 触发）会完成以下工作，这些是 `visit()` 能自动发现所有嵌套实例的**前提**：
+
+1. **解析模块实例化** — 将 CST 中的 `HierarchyInstantiation`（如 `adder_8bit u_adder(...)`）解析为 AST 中的 `InstanceSymbol`，挂到父 `InstanceBodySymbol` 的符号树下
+2. **展开 generate 块** — 解析 `if/for/case` generate，为实际生成的实例创建对应的 `InstanceSymbol`
+3. **展开 parameter** — 参数化模块的类型和位宽在 elaboration 后成为具体值
+4. **解析 config / bind** — 建立 `config` 绑定关系和 `bind` 语句
+
+这意味着：**在 elaboration 之后的 AST 中，所有实例化关系已经是一棵完整的树**。一个顶层模块 A 实例化了 B，B 实例化了 C，那么在 A 的 `InstanceBodySymbol` 的符号树中，B 是其直接子符号，而 C 出现在 B 的 `InstanceBodySymbol` 的符号树中。
+
+`InstanceSymbol.visit(callback)` 遍历的正是这棵**已经构建好的树**——它不需要递归打开文件，不需要手动管理 `Compilation`，所有嵌套关系在 elaboration 时就已经确定了。
+
+**如果缺少子模块定义**（未将某些 SV 文件加入 `Compilation`），elaboration 无法解析子模块，它们会退化为 `SymbolKind.UninstantiatedDef` 而非 `InstanceSymbol`。因此层次遍历**必须一次性编译所有源文件**。
+
 ### 3.2 顶层实例与模块查找
 
 ```python
@@ -382,7 +397,30 @@ inst.portConnections      # list[PortConnection]: 实例的端口连接
 
 #### 3.9.2 visit() 递归遍历
 
-所有 Symbol 子类都有 `visit(callback)` 方法，以深度优先遍历整个符号子树。**注意**：visit 会遍历**所有**符号节点（含表达式、语句等），很多节点没有 `name` 属性，callback 需先检查。
+所有 Symbol 子类都有 `visit(callback)` 方法。**关键保证**：`visit()` 以**DFS（深度优先、前序）**遍历整个符号子树——不是只访问一层，而是递归进入每一层嵌套。
+
+**为什么嵌套实例会被找到？**
+
+elaboration 之后，AST 中的实例化关系是一棵完整的树：
+
+```
+RootSymbol
+├── topInstances[0]: alu_system          ← 顶层实例（未被其他模块实例化）
+│   └── InstanceBodySymbol               ← 展开后的实例体
+│       ├── PortSymbol: clk, rst, ...    ← 端口
+│       ├── InstanceSymbol: u_core       ← 嵌套子实例（在 body 的符号树中）
+│       │   └── InstanceBodySymbol
+│       │       ├── InstanceSymbol: u_adder   ← 更深层嵌套
+│       │       │   └── InstanceBodySymbol ...
+│       │       └── InstanceSymbol: u_mult
+│       │           └── InstanceBodySymbol ...
+│       └── InstanceSymbol: u_io_ctrl    ← 另一个子实例
+│           └── InstanceBodySymbol ...
+├── topInstances[1]: another_top
+│   └── ...
+```
+
+当调用 `top_inst.visit(callback)` 时，遍历从顶层实例的根开始，DFS 进入每一层 `InstanceBodySymbol`，因此 callback 会按**前序**（父先于子）依次遇到所有层级的 `InstanceSymbol`。
 
 ```python
 instances = []
@@ -392,18 +430,28 @@ def collect_instances(sym):
     if sym.kind == ast.SymbolKind.Instance:
         instances.append(sym)
 
-# 对每个顶层实例启动遍历
+# 对每个顶层实例启动遍历——一次 visit() 覆盖所有层级
 for top_inst in root.topInstances:
     top_inst.visit(collect_instances)
 
-# instances 现在包含所有层次中的所有实例（DFS 前序）
-# 每个 InstanceSymbol 的 hierarchicalPath 自动正确
+# instances 现在包含所有层次中的全部实例（DFS 前序）
+# 每个 InstanceSymbol.hierarchicalPath 自动正确：
+#   "alu_system.u_core"         ← 第二层
+#   "alu_system.u_core.u_adder" ← 第三层
+#   "alu_system.u_core.u_mult"  ← 第三层
+#   "alu_system.u_io_ctrl"      ← 第二层
 ```
 
-**为什么不用 `body.syntax.members` 手动递归？**
-- CST 遍历需要递归打开每个子模块的文件 → 手动管理 Compilation
-- `visit()` 在 elaboration 后的 AST 上运行，pyslang 自动解析所有子模块
-- `hierarchicalPath` 自动提供正确格式的路径
+**注意**：`visit()` 会遍历**所有**类型的符号节点（含表达式、语句、类型等），很多节点没有 `name` 属性，callback **必须**用 `sym.kind` 过滤目标类型。
+
+#### 3.9.2.1 为什么不用 CST 手动递归？
+
+| 方式 | 问题 |
+|---|---|
+| CST `body.syntax.members` 手动递归 | 需要递归打开每个子模块的文件 → 需要手动管理多个 `Compilation`；无法自动跨越文件边界 |
+| AST `visit()` | elaboration 已解析所有子模块 → 一棵完整的树，一次遍历即可 |
+
+**`visit()` 之所以简洁有效，核心在于 pyslang 已经在 elaboration 阶段替我们做完了最重的活**——解析模块实例化、展开 generate、推导 parameter、建立完整的符号树。`visit()` 只需要在这棵树上做 DFS 遍历并筛选目标节点。
 
 #### 3.9.3 额外属性
 
@@ -595,5 +643,6 @@ def extract_hierarchy(sv_files):
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.2.0 | 2026-07-29 | 新增：Elaboration 概念章节（3.1.1）阐述 pyslang elaboration 阶段所做的工作及为何 visit() 能自动递归；增强 visit() 递归遍历（3.9.2）— AST 实例树结构图、DFS 前序保证、前序示例路径、CST 手动递归对比表 |
 | 1.1.0 | 2026-07-26 | 新增：InstanceSymbol 层次遍历（3.9）、DefinitionSymbol（3.10）、InstanceBodySymbol 补充属性（3.11）、层次遍历编码模式（4.3）；新增 SyntaxKind.HierarchyInstantiation（2.2）、CST 实例化节点结构（2.7）；新增 SymbolKind（UninstantiatedDef/ContinuousAssign/ProceduralBlock/Subroutine）；补充 SourceManager.getFileName/getFullPath 区分（3.8）；补充 Diagnostic 结构（3.1）；新增「已确认需要区分的 API」和「运行时行为」纠正项（5） |
 | 1.0.0 | 2026-07-26 | 初始版本，覆盖 CST/AST 核心 API、端口扫描、变量扫描、源位置映射 |
