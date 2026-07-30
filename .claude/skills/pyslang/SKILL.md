@@ -1,7 +1,7 @@
 ---
 name: pyslang
 description: This skill should be used when writing Python scripts that parse, analyze, or extract information from SystemVerilog files using the pyslang library. Covers CST (syntax tree), AST (elaborated symbol tree), type resolution, port/variable extraction, and source location mapping. Triggers on phrases like "pyslang", "用pyslang", "扫描SV", "提取端口", "SystemVerilog解析", "slang python", or when working with .sv file analysis tools.
-version: 1.4.0
+version: 1.4.1
 ---
 
 # pyslang API Reference & Coding Guide
@@ -325,6 +325,19 @@ port.internalExpr         # Expression: 端口内部连接表达式
 ```python
 from pyslang import ast
 
+# 枚举值（用于分支逻辑判断）：
+ast.ArgumentDirection.In       # 输入端口
+ast.ArgumentDirection.Out      # 输出端口
+ast.ArgumentDirection.InOut    # 双向端口
+ast.ArgumentDirection.Ref      # ref 端口
+
+# 比较模式（推荐）：直接枚举比较
+if port.direction == ast.ArgumentDirection.In:
+    ...  # 输入端口的处理
+elif port.direction == ast.ArgumentDirection.Out:
+    ...  # 输出端口的处理
+
+# 字符串映射（仅用于输出/显示）：
 DIRECTION_MAP = {
     ast.ArgumentDirection.In:    'input',
     ast.ArgumentDirection.Out:   'output',
@@ -1113,12 +1126,34 @@ def find_input_port_connection(body, var_name):
 - **`body.containingInstance` 类型** — 返回的是 `InstanceBodySymbol`，不是 `InstanceSymbol`。要访问 `portConnections` 需用 `body.containingInstance.parentInstance`。
 - **获取完整实例化源文本** — `inst.syntax` 是 `HierarchicalInstance` CST（单个实例行），`inst.syntax.parent` 才是 `HierarchyInstantiation` CST（完整 `module_type inst_name (...);` 语句）。
 
+### 已验证的编码最佳实践
+
+- **`hasattr` 防御性属性访问** — pyslang 是 C++ 的 Python 绑定，某些属性在特定节点类型上可能不存在或为 None。访问 `Expression.left`、`Expression.symbol`、`PortConnection.expression` 等属性前应使用 `hasattr` 或判 None：
+  ```python
+  # 安全访问模式
+  left = node.left if hasattr(node, 'left') else None
+  s = left.symbol if left is not None and hasattr(left, 'symbol') else None
+  expr = conn.expression if hasattr(conn, 'expression') else None
+  if expr is None:
+      continue
+  ```
+- **`id(symbol)` 去重** — pyslang 的 Symbol 对象在单次 elaboration 中具有**稳定的 Python 对象身份**。同一个变量（如 `alu_system.opcode`）在 AST 中的多个引用位置会返回相同的 Python 对象。因此 `id(s)` 可用于 Symbol 去重：
+  ```python
+  seen = set()
+  for s in driven_symbols:
+      if id(s) not in seen:
+          seen.add(id(s))
+          symbols.append(s)
+  ```
+  注意：**不能**用 `symbol.name` 去重——不同模块中可能有同名变量（如 `opcode` 同时存在于 `alu_system` 和 `alu_core`）。必须用 `id()` 或 `symbol.hierarchicalPath` 区分。
+
 ---
 
 ## 6. 更新日志
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.4.1 | 2026-07-30 | 完善：3.5 ArgumentDirection — 明确枚举值列表和直接比较模式（区分 DIRECTION_MAP 仅用于显示）；5 新增「已验证的编码最佳实践」— hasattr 防御性属性访问、id(symbol) 去重（name 不能去重的原因）|
 | 1.4.0 | 2026-07-30 | 新增：ExpressionKind 枚举（Assignment/NamedValue 等）和 ProceduralBlockKind 枚举（3.3）；编码模式 4.5 AST 块内变量扫描 — LHS-only 排除算法（Counter 计数法）；4.6 查找赋值块 — parentScope.containingInstance 过滤子实例穿透；4.7 端口连接追踪 — 输入/输出端口双向、HierarchyInstantiation 源文本提取、子模块端口变量获取；新发现 — visit() 穿透子实例、body.containingInstance 类型纠正（InstanceBodySymbol vs InstanceSymbol）、inst.syntax.parent 获取完整实例化 CST |
 | 1.3.0 | 2026-07-30 | 新增：端口连接表达式结构（3.9.1.1）— 输入/输出端口的 Expression 结构差异与扇出追踪方法；编码模式 4.4 变量扇出追踪 — 三类信号分类、块扇出、输入端口扇出、输出端口向上追溯；PortSymbol 补充 — findPort()、internalSymbol；确认 API 区分 — find() vs findPort()、输入/输出端口连接表达式结构不同 |
 | 1.2.0 | 2026-07-29 | 新增：Elaboration 概念章节（3.1.1）阐述 pyslang elaboration 阶段所做的工作及为何 visit() 能自动递归；增强 visit() 递归遍历（3.9.2）— AST 实例树结构图、DFS 前序保证、前序示例路径、CST 手动递归对比表 |
