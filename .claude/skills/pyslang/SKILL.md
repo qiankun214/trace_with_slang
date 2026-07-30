@@ -1,7 +1,7 @@
 ---
 name: pyslang
 description: This skill should be used when writing Python scripts that parse, analyze, or extract information from SystemVerilog files using the pyslang library. Covers CST (syntax tree), AST (elaborated symbol tree), type resolution, port/variable extraction, and source location mapping. Triggers on phrases like "pyslang", "用pyslang", "扫描SV", "提取端口", "SystemVerilog解析", "slang python", or when working with .sv file analysis tools.
-version: 1.2.0
+version: 1.4.0
 ---
 
 # pyslang API Reference & Coding Guide
@@ -267,6 +267,27 @@ SK.UninstantiatedDef # 未实例化的定义（缺少子模块定义时出现）
 SK.ContinuousAssign  # 连续赋值 (assign)
 SK.ProceduralBlock   # 过程块 (always_comb, always_ff, etc.)
 SK.Subroutine        # 子例程 (function, task)
+
+# ExpressionKind 枚举 — 用于 AST 级表达式分析
+EK = ast.ExpressionKind
+EK.Assignment        # 赋值（含阻塞 =、非阻塞 <=、复合 += 等）
+                     # 属性: .left (LHS), .right (RHS), .isNonBlocking (bool), .isCompound (bool)
+EK.NamedValue        # 变量/信号引用
+                     # 属性: .symbol → VariableSymbol/NetSymbol（已解析类型/位宽/路径）
+EK.UnaryOp           # 一元运算
+EK.BinaryOp          # 二元运算
+EK.IntegerLiteral    # 整数常量
+EK.Conversion        # 类型转换
+EK.EmptyArgument     # 空参数（端口连接中输出端口 RHS 常见）
+
+# ProceduralBlockKind 枚举 — 用于区分过程块类型
+PBK = ast.ProceduralBlockKind
+PBK.AlwaysComb       # always_comb
+PBK.AlwaysFF         # always_ff
+PBK.AlwaysLatch      # always_latch
+PBK.Always           # always (通用)
+PBK.Initial          # initial
+PBK.Final            # final
 ```
 
 ### 3.4 PortSymbol（端口）
@@ -279,7 +300,25 @@ port.direction            # ArgumentDirection 枚举
 port.isNetPort            # bool: 是否为网络端口
 port.isAnsiPort           # bool: 是否为 ANSI 端口
 port.type                 # Type: 推导后的类型对象
+
+# 端口查找
+body.findPort("port_name")   # 按名称查找端口，返回 PortSymbol 或 None
+                             # 与 body.find() 不同：find() 查找变量/网络，findPort() 查找端口
+
+# 端口对应的内部信号（用于跨模块扇出追踪）
+port.internalSymbol       # Symbol: 端口模块内部的对应变量
+                          # 输入端口：模块内部接收输入值的变量（如 input a → a）
+                          # 输出端口：模块内部驱动输出值的变量
+port.internalExpr         # Expression: 端口内部连接表达式
 ```
+
+**`findPort()` vs `find()`**：
+- `body.find("clk")` → 查找内部变量/网络名为 `clk`（可能返回 VariableSymbol）
+- `body.findPort("clk")` → 查找端口名为 `clk`（返回 PortSymbol 或 None）
+- 端口在 `body.portList` 中，但 `find()` 不一定能查到端口
+
+**`internalSymbol` 的用途**：在扇出追踪中，当变量连接到子模块的输入端口时，
+`port.internalSymbol` 给出子模块内部接收该信号的变量，可继续在子模块中追踪。
 
 ### 3.5 方向枚举 (ArgumentDirection)
 
@@ -391,8 +430,40 @@ inst.body.syntax          # ModuleDeclarationSyntax: CST 节点（含 members �
 inst.portConnections      # list[PortConnection]: 实例的端口连接
 # PortConnection 属性:
 #   conn.port       → PortSymbol: 被连接的端口
-#   conn.expression → Expression: 连接到的表达式
+#   conn.expression → Expression: 连接到的表达式（结构因方向而异，见下方）
 #   conn.ifaceConn  → 接口连接（若为接口端口）
+```
+
+#### 3.9.1.1 端口连接的表达式结构（输入 vs 输出）
+
+`conn.expression` 的结构取决于端口方向 —— 这是向下游扇出和向上游追溯的核心：
+
+```
+对于输入端口 (port.direction == In)：
+  父模块:  alu_core u_core (.opcode(opcode), ...);
+                                     ^^^^^^
+  conn.expression.kind == ExpressionKind.NamedValue
+  conn.expression.symbol → 父模块的变量 "opcode"
+  conn.port.internalSymbol → 子模块内部变量 "opcode"（用于继续追踪）
+
+对于输出端口 (port.direction == Out)：
+  父模块:  alu_core u_core (.result(core_result), ...);
+                                      ^^^^^^^^^^^
+  conn.expression.kind == ExpressionKind.Assignment
+  conn.expression.left   → 父模块被驱动的变量 "core_result"（NamedValue）
+  conn.expression.right  → 通常是 EmptyArgument
+  conn.port.internalSymbol → 子模块内部变量 "result"
+```
+
+**输入端口扇出追踪**（向下游）：变量 X 连接到了子模块的输入端口 P：
+1. 遍历 `inst.portConnections`，筛选 `port.direction == In`
+2. 对 `conn.expression` 做 `visit()`，查找 `NamedValue` 匹配变量名 X
+3. 命中 → `port.internalSymbol` 即子模块内的下游变量
+
+**输出端口向上追溯**（从子模块输出端口回到父模块）：
+1. 在父模块中，遍历 `inst.portConnections`，筛选 `port.direction == Out`
+2. 对 `conn.expression`（`AssignmentExpression`），`.left.symbol` 即父模块的外部变量
+3. 此外部变量可在父模块中按输入端口扇出继续追踪
 ```
 
 #### 3.9.2 visit() 递归遍历
@@ -497,7 +568,9 @@ defn.syntax              # CST 节点
 body = inst.body  # InstanceBodySymbol
 
 # 除了已记录的 portList, find(), findPort(), syntax:
-body.containingInstance   # InstanceSymbol: 包含此体的实例
+body.containingInstance   # InstanceBodySymbol: 包含此体的实例体（非 InstanceSymbol！）
+                           # 注意: 返回值类型是 InstanceBodySymbol，不是 InstanceSymbol
+body.containingInstance.parentInstance  # InstanceSymbol: 真正的实例符号（含 portConnections）
 body.parentInstance       # InstanceSymbol: 父实例
 body.lookupName(name)     # 按名称查找子符号
 body.parameters           # list: 参数列表
@@ -594,7 +667,403 @@ def extract_hierarchy(sv_files):
 - `inst.definition.name`（模块类型名）≠ `inst.name`（实例名）
 - `DefinitionSymbol` 没有 `body` 属性，必须通过 `InstanceSymbol.body` 访问 `InstanceBodySymbol`
 
-### 4.4 禁止的写法
+### 4.4 变量扇出追踪（Variable Fan-Out Tracing）
+
+三类信号分类 + 单级扇出追踪。给定一个变量，找到它**直接**驱动的下一级变量（仅一跳）。
+
+#### 4.4.1 信号分类与入口分发
+
+用 `body.findPort()` 判断变量类型，分发到不同追踪逻辑：
+
+```python
+def trace_var_driver(filelist_path, var_path):
+    # ... 复用 hierarchy 构建层次、hierarchy_var 解析变量 ...
+    body = hierarchy[inst_path]['ast']
+
+    is_input, is_output = _is_port(body, var_name)
+
+    if is_output:
+        # 情况 3：输出端口 → 向上追溯到父模块 wire
+        symbols = _trace_output_port(hierarchy, inst_path, var_name)
+    else:
+        # 情况 1/2：内部变量或输入端口 → 模块内追踪
+        symbols = _trace_in_module(body, var_name)
+
+    return _build_result(var_info, symbols)
+
+
+def _is_port(body, var_name):
+    """判断变量是否为端口"""
+    port = body.findPort(var_name)  # 注意：用 findPort() 而非 find()
+    if port is None:
+        return False, False
+    is_input = port.direction == ast.ArgumentDirection.In
+    is_output = port.direction == ast.ArgumentDirection.Out
+    return is_input, is_output
+```
+
+#### 4.4.2 模块内追踪（内部变量 / 输入端口）
+
+两步：A. 块扇出 + B. 子模块端口扇出。
+
+**A. 块扇出** — 找读取该变量的 ProceduralBlock / ContinuousAssign，收集所有 LHS：
+
+```python
+def _find_block_fanout(body, var_name, target_ci):
+    driven = []
+
+    def check_block(sym):
+        if sym.kind not in (ast.SymbolKind.ProceduralBlock,
+                            ast.SymbolKind.ContinuousAssign):
+            return
+        # 过滤：只查当前模块的直接块
+        parent = sym.parentScope
+        if hasattr(parent, 'containingInstance'):
+            if parent.containingInstance is not target_ci:
+                return
+
+        lhs_syms = set()
+        var_lhs_count = 0
+        var_total_count = 0
+
+        def collect(node):
+            nonlocal var_lhs_count, var_total_count
+            if node.kind == ast.ExpressionKind.Assignment:
+                left = node.left if hasattr(node, 'left') else None
+                if left is not None and left.kind == ast.ExpressionKind.NamedValue:
+                    s = left.symbol if hasattr(left, 'symbol') else None
+                    if s is not None:
+                        lhs_syms.add(s)
+                        if s.name == var_name:
+                            var_lhs_count += 1
+            if node.kind == ast.ExpressionKind.NamedValue:
+                s = node.symbol if hasattr(node, 'symbol') else None
+                if s is not None and s.name == var_name:
+                    var_total_count += 1
+
+        sym.visit(collect)
+
+        # var_name 出现在 RHS/条件中（不仅是 LHS）→ 被读取
+        if var_total_count > var_lhs_count:
+            driven.extend(lhs_syms)
+
+    body.visit(check_block)
+    return driven
+```
+
+**关键点**：Counter 计数法判断读取关系 — 若 `var_name` 的总引用次数 > LHS 出现次数，
+说明该变量在 RHS 或条件中被**读取**，则块内所有 LHS 变量都被它驱动。
+
+**B. 子模块端口扇出** — 找由该变量驱动的子模块输入端口：
+
+```python
+def _find_input_port_fanout(body, var_name, target_ci):
+    driven = []
+
+    def check_instance(sym):
+        if sym.kind != ast.SymbolKind.Instance:
+            return
+        parent = sym.parentScope
+        if hasattr(parent, 'containingInstance'):
+            if parent.containingInstance is not target_ci:
+                return
+
+        for conn in sym.portConnections:
+            port = conn.port
+            if port is None or port.direction != ast.ArgumentDirection.In:
+                continue
+            expr = conn.expression if hasattr(conn, 'expression') else None
+            if expr is None:
+                continue
+
+            found = False
+            def check_expr(node):
+                nonlocal found
+                if found:
+                    return
+                if node.kind == ast.ExpressionKind.NamedValue:
+                    s = node.symbol if hasattr(node, 'symbol') else None
+                    if s is not None and s.name == var_name:
+                        found = True
+            expr.visit(check_expr)
+
+            if found:
+                internal = port.internalSymbol if hasattr(port, 'internalSymbol') else None
+                if internal is not None:
+                    driven.append(internal)
+
+    body.visit(check_instance)
+    return driven
+```
+
+#### 4.4.3 输出端口向上追溯
+
+输出端口不在模块内部追踪，而是回到父模块找对应的 wire：
+
+```python
+def _trace_output_port(hierarchy, inst_path, port_name):
+    """从子模块输出端口上溯到父模块 wire，不继续往下穿透。"""
+    segments = inst_path.split('.')
+    if len(segments) < 2:
+        return []  # 顶层模块无父模块
+
+    parent_inst_path = '.'.join(segments[:-1])
+    inst_name = segments[-1]
+
+    parent_body = hierarchy[parent_inst_path]['ast']
+    parent_target_ci = parent_body.containingInstance
+
+    result = []
+    def find_instance(sym):
+        nonlocal result
+        if result:
+            return
+        if sym.kind != ast.SymbolKind.Instance:
+            return
+        if sym.name != inst_name:
+            return
+        p = sym.parentScope
+        if hasattr(p, 'containingInstance'):
+            if p.containingInstance is not parent_target_ci:
+                return
+
+        for conn in sym.portConnections:
+            port = conn.port
+            if port is None or port.direction != ast.ArgumentDirection.Out:
+                continue
+            if port.name != port_name:
+                continue
+            expr = conn.expression if hasattr(conn, 'expression') else None
+            if expr is None:
+                continue
+            # 输出端口连接表达式 = Assignment，.left = 父模块外部变量
+            if expr.kind == ast.ExpressionKind.Assignment:
+                left = expr.left if hasattr(expr, 'left') else None
+                if left is not None and left.kind == ast.ExpressionKind.NamedValue:
+                    s = left.symbol if hasattr(left, 'symbol') else None
+                    if s is not None:
+                        result = [s]  # 只返回父模块 wire，不进一步穿透
+
+    parent_body.visit(find_instance)
+    return result
+```
+
+**设计原则**：`_trace_output_port` 只返回父模块 wire，**不继续穿透**。保证每一级
+扇出是精确的一跳。例如 `alu_system.u_core.carry` → 返回 `[alu_system.core_carry]`，
+用户再调用 `trace_var_driver(..., "alu_system.core_carry")` 追下一级。
+
+#### 4.4.4 扇出追踪的完整数据流
+
+```
+输入: alu_system.u_core.carry (输出端口)
+  → _is_port 判断为输出端口
+  → _trace_output_port:
+      inst_path="alu_system.u_core", port_name="carry"
+      → 父模块 alu_system 中找实例 u_core
+      → 遍历 portConnections，找到 port.name=="carry" 的 Out 连接
+      → 提取外部变量: alu_system.core_carry  ← 返回值
+
+输入: alu_system.core_carry (内部变量)
+  → _is_port 判断为内部变量
+  → _trace_in_module:
+      A. _find_block_fanout: 无块读取 core_carry → 空
+      B. _find_input_port_fanout:
+         → 遍历子实例 (u_result) 的输入端口连接
+         → 找到 .carry_in(core_carry) 匹配
+         → 返回 port.internalSymbol: u_result.carry_in  ← 返回值
+
+输入: alu_system.u_core.opcode (输入端口)
+  → _is_port 判断为输入端口
+  → _trace_in_module:
+      A. _find_block_fanout:
+         → always_comb: opcode 在 if 条件中被引用 → 收集 add_b_mux, add_cin
+         → assign: opcode 在 RHS → 收集 logic_sel
+         → always_comb case: opcode 在 case 表达式 → 收集 result, carry
+      B. _find_input_port_fanout: opcode 未直接连到子模块输入 → 空
+  → 返回 5 个被驱动变量
+```
+
+### 4.5 AST 过程块/赋值语句内部变量扫描
+
+用 `ExpressionKind.Assignment` 和 `ExpressionKind.NamedValue` 在 AST 层扫描 always 块/assign 语句内部的赋值和变量引用，区分 LHS-only（仅被赋值）和 RHS/条件读取变量。
+
+```python
+from collections import Counter
+
+def scan_block_variables(ast_symbol):
+    """扫描块内变量，返回被读取的 Symbol 集合（排除仅 LHS 的变量）。"""
+    lhs_symbols = []  # 赋值 LHS 的 symbol
+    all_symbols = []  # 所有 NamedValue 的 symbol
+
+    def collect(node):
+        if node.kind == ast.ExpressionKind.Assignment:
+            left = node.left if hasattr(node, 'left') else None
+            if left is not None and left.kind == ast.ExpressionKind.NamedValue:
+                s = left.symbol if hasattr(left, 'symbol') else None
+                if s is not None:
+                    lhs_symbols.append(s)
+        if node.kind == ast.ExpressionKind.NamedValue:
+            s = node.symbol if hasattr(node, 'symbol') else None
+            if s is not None:
+                all_symbols.append(s)
+
+    ast_symbol.visit(collect)
+
+    # 排除仅出现在 LHS 的变量
+    lhs_count = Counter(id(s) for s in lhs_symbols)
+    all_count = Counter(id(s) for s in all_symbols)
+    return {s for s in all_symbols if all_count[id(s)] > lhs_count.get(id(s), 0)}
+```
+
+**LHS-only 判定原理**：变量引用（`NamedValue`）在 AST 中不区分左右侧——`a = a + 1` 中，左 `a` 和右 `a` 都是 `NamedValue`。但 `Assignment.left` 天然区分了位置。因此：如果某 symbol 的 LHS 出现次数 == 总出现次数，说明它从未出现在 RHS/条件中 → 排除。
+
+**适用**：`ProceduralBlock`（always_comb/always_ff 等）、`ContinuousAssign`。
+
+### 4.6 查找赋值块（AST 遍历 + parentScope 过滤）
+
+`body.visit()` 会**穿透子模块实例**——遍历 `alu_core` 的 body 时，`adder_8bit` 内部的 `ProceduralBlock` 也会被访问到。必须用 `parentScope.containingInstance` 过滤：
+
+```python
+def find_containing_block(body, var_name, target_ci):
+    """在 body 的直接块中查找包含 var_name 赋值的块。"""
+    result = [None]
+
+    def check_block(sym):
+        if result[0] is not None:
+            return
+        if sym.kind not in (ast.SymbolKind.ProceduralBlock,
+                            ast.SymbolKind.ContinuousAssign):
+            return
+        # 过滤子实例块：只保留 parentScope.containingInstance == target_ci 的
+        parent = sym.parentScope
+        if hasattr(parent, 'containingInstance'):
+            if parent.containingInstance is not target_ci:
+                return  # 跳过子实例中的块
+        # 在块内查找目标变量的赋值
+        found = False
+        def check_assign(node):
+            nonlocal found
+            if found: return
+            if node.kind == ast.ExpressionKind.Assignment:
+                left = node.left if hasattr(node, 'left') else None
+                if left and left.kind == ast.ExpressionKind.NamedValue:
+                    s = left.symbol if hasattr(left, 'symbol') else None
+                    if s and s.name == var_name:
+                        found = True
+        sym.visit(check_assign)
+        if found:
+            result[0] = sym
+
+    body.visit(check_block)
+    return result[0]
+```
+
+### 4.7 端口连接追踪（输入/输出端口双向）
+
+#### 数据结构
+
+| 端口方向 | `conn.expression.kind` | 变量访问方式 |
+|---------|------------------------|-------------|
+| `In` | `ExpressionKind.NamedValue` | `expr.symbol` → 父模块驱动变量 |
+| `Out` | `ExpressionKind.Assignment` | `expr.left.symbol` → 父模块被驱动变量 |
+
+#### 获取实例的 CST 完整实例化源文本
+
+```python
+# inst_ast: InstanceSymbol
+# inst_ast.syntax → HierarchicalInstance CST（单个实例）
+# inst_ast.syntax.parent → HierarchyInstantiation CST（完整实例化语句如 "adder_8bit u_adder (...);"）
+hier_inst_cst = inst_ast.syntax.parent
+sr = hier_inst_cst.sourceRange
+# 用 sm.getLineNumber(sr.start) / sm.getLineNumber(sr.end) 获取行号
+# 从文件读取该行范围的源文本
+```
+
+#### 输出端口追踪（找到驱动目标变量的子模块端口）
+
+```python
+def find_driving_instance(body, var_name, target_ci):
+    """查找输出端口连接中包含 var_name 的子实例。"""
+    result = [None]
+    def check_inst(sym):
+        if result[0] is not None: return
+        if sym.kind != ast.SymbolKind.Instance: return
+        parent = sym.parentScope
+        if hasattr(parent, 'containingInstance'):
+            if parent.containingInstance is not target_ci: return
+        for conn in sym.portConnections:
+            port = conn.port
+            if port is None or port.direction != ast.ArgumentDirection.Out:
+                continue
+            expr = conn.expression
+            if expr is None: continue
+            # 检查是否包含目标变量
+            if expr.kind == ast.ExpressionKind.Assignment:
+                left = expr.left
+                if left and left.kind == ast.ExpressionKind.NamedValue:
+                    s = left.symbol
+                    if s and s.name == var_name:
+                        result[0] = sym
+                        return
+    body.visit(check_inst)
+    return result[0]
+
+# 获取驱动目标变量的子模块端口（而非全部输出端口）
+def collect_driving_port(inst_ast, var_name):
+    for conn in inst_ast.portConnections:
+        port = conn.port
+        if port is None or port.direction != ast.ArgumentDirection.Out:
+            continue
+        expr = conn.expression
+        if expr is None: continue
+        # 检查连接表达式是否匹配目标变量
+        matches = False
+        if expr.kind == ast.ExpressionKind.NamedValue:
+            s = expr.symbol
+            if s and s.name == var_name: matches = True
+        elif expr.kind == ast.ExpressionKind.Assignment:
+            left = expr.left
+            if left and left.kind == ast.ExpressionKind.NamedValue:
+                s = left.symbol
+                if s and s.name == var_name: matches = True
+        if matches:
+            # 返回子模块端口 VariableSymbol（如 alu_system.u_core.carry）
+            port_sym = inst_ast.body.find(port.name)
+            if port_sym: return port_sym
+    return None
+```
+
+#### 输入端口追踪（找到驱动输入端口的父模块信号）
+
+```python
+def find_input_port_connection(body, var_name):
+    """检查变量是否为输入端口，返回驱动它的父模块信号。"""
+    # 1. 确认是输入端口
+    for port in body.portList:
+        if port.name == var_name and port.direction == ast.ArgumentDirection.In:
+            break
+    else:
+        return None  # 不是输入端口
+
+    # 2. 从当前实例的端口连接找驱动信号
+    # body.containingInstance 是 InstanceBodySymbol
+    # body.containingInstance.parentInstance 才是 InstanceSymbol（含 portConnections）
+    inst_sym = body.containingInstance.parentInstance
+    if inst_sym is None:
+        return None
+
+    for conn in inst_sym.portConnections:
+        if conn.port is None or conn.port.name != var_name:
+            continue
+        expr = conn.expression
+        if expr is None: continue
+        # 输入端口连接是 NamedValue
+        if expr.kind == ast.ExpressionKind.NamedValue:
+            return expr.symbol  # 如 core_carry
+    return None
+```
+
+### 4.8 禁止的写法
 
 - `str(kind) == "SyntaxKind.XXX"` → 用 `kind == SK.XXX` 枚举比较
 - `'Input' in str(kind)` → 用 `kind == TK.InputKeyword` 枚举比较  
@@ -631,11 +1100,18 @@ def extract_hierarchy(sv_files):
 - `DefinitionSymbol` 没有 `body` 属性 — 必须通过 `InstanceSymbol.body` 访问 `InstanceBodySymbol`
 - `Diagnostic.isError()` — 是**方法**不是属性，需要加 `()` 调用
 - `hierarchicalPath` — `InstanceSymbol` 和 `InstanceBodySymbol` 都有此属性，格式为 `"topModule.childInst.grandchildInst"`
+- **`body.find(name)` vs `body.findPort(name)`** — 前者查找变量/网络/参数等内部符号，后者查找端口；端口不在 `find()` 的查找范围内，必须用 `findPort()`
+- **输入端口 vs 输出端口的连接表达式结构不同**：
+  - 输入端口：`conn.expression.kind == ExpressionKind.NamedValue`，`.symbol` 是父模块变量
+  - 输出端口：`conn.expression.kind == ExpressionKind.Assignment`，`.left.symbol` 是父模块被驱动变量
 
 ### 已确认的运行时行为
 
 - **缺少子模块定义** — 若未将所有 SV 文件加入 `Compilation`，子模块实例在 AST 中表现为 `UninstantiatedDefSymbol` 而非 `InstanceSymbol`，`visit()` 仍会遍历到它们但 `kind` 不同。层次遍历**必须一次性编译所有源文件**。
 - **visit() 遍历范围** — `visit(callback)` 会遍历所有类型的符号节点（含表达式、语句等），callback 必须用 `sym.kind` 过滤目标类型，不可假设所有节点都有 `name` 属性。
+- **`visit()` 穿透子实例** — `InstanceBodySymbol.visit()` 会遍历子模块实例内的符号（如 `alu_core` body 的 visit 会进入 `adder_8bit` 的 `ProceduralBlock`）。需用 `sym.parentScope.containingInstance is target_ci` 过滤仅保留当前模块的直接块。
+- **`body.containingInstance` 类型** — 返回的是 `InstanceBodySymbol`，不是 `InstanceSymbol`。要访问 `portConnections` 需用 `body.containingInstance.parentInstance`。
+- **获取完整实例化源文本** — `inst.syntax` 是 `HierarchicalInstance` CST（单个实例行），`inst.syntax.parent` 才是 `HierarchyInstantiation` CST（完整 `module_type inst_name (...);` 语句）。
 
 ---
 
@@ -643,6 +1119,8 @@ def extract_hierarchy(sv_files):
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.4.0 | 2026-07-30 | 新增：ExpressionKind 枚举（Assignment/NamedValue 等）和 ProceduralBlockKind 枚举（3.3）；编码模式 4.5 AST 块内变量扫描 — LHS-only 排除算法（Counter 计数法）；4.6 查找赋值块 — parentScope.containingInstance 过滤子实例穿透；4.7 端口连接追踪 — 输入/输出端口双向、HierarchyInstantiation 源文本提取、子模块端口变量获取；新发现 — visit() 穿透子实例、body.containingInstance 类型纠正（InstanceBodySymbol vs InstanceSymbol）、inst.syntax.parent 获取完整实例化 CST |
+| 1.3.0 | 2026-07-30 | 新增：端口连接表达式结构（3.9.1.1）— 输入/输出端口的 Expression 结构差异与扇出追踪方法；编码模式 4.4 变量扇出追踪 — 三类信号分类、块扇出、输入端口扇出、输出端口向上追溯；PortSymbol 补充 — findPort()、internalSymbol；确认 API 区分 — find() vs findPort()、输入/输出端口连接表达式结构不同 |
 | 1.2.0 | 2026-07-29 | 新增：Elaboration 概念章节（3.1.1）阐述 pyslang elaboration 阶段所做的工作及为何 visit() 能自动递归；增强 visit() 递归遍历（3.9.2）— AST 实例树结构图、DFS 前序保证、前序示例路径、CST 手动递归对比表 |
 | 1.1.0 | 2026-07-26 | 新增：InstanceSymbol 层次遍历（3.9）、DefinitionSymbol（3.10）、InstanceBodySymbol 补充属性（3.11）、层次遍历编码模式（4.3）；新增 SyntaxKind.HierarchyInstantiation（2.2）、CST 实例化节点结构（2.7）；新增 SymbolKind（UninstantiatedDef/ContinuousAssign/ProceduralBlock/Subroutine）；补充 SourceManager.getFileName/getFullPath 区分（3.8）；补充 Diagnostic 结构（3.1）；新增「已确认需要区分的 API」和「运行时行为」纠正项（5） |
 | 1.0.0 | 2026-07-26 | 初始版本，覆盖 CST/AST 核心 API、端口扫描、变量扫描、源位置映射 |
