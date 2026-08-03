@@ -13,6 +13,7 @@ __pycache__/
 *.vvp
 *.vcd
 *.lxt
+obj_dir/
 
 # Distribution / packaging
 *.egg-info/
