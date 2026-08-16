@@ -32,7 +32,7 @@ from pyslang import ast
 # 复用已有模块的公开函数
 from hierarchy import parse_filelist, extract_hierarchy
 from hierarchy_var import find_hierarch_var
-from trace_var import _build_variable_info
+from trace_var import _build_variable_info, _match_variable, collect_member_chain as _collect_member_chain
 
 
 # ==============================================================================
@@ -66,6 +66,7 @@ def trace_var_driver(filelist_path, var_path):
     var_info = find_hierarch_var(hierarchy, var_path)
     inst_path = var_info['instance_path']
     var_name = var_info['name']
+    member_path = var_info.get('member_path', [var_name])
 
     entry = hierarchy.get(inst_path)
     if entry is None:
@@ -81,7 +82,7 @@ def trace_var_driver(filelist_path, var_path):
         symbols = _trace_output_port(hierarchy, inst_path, var_name)
     else:
         # 情况 1 / 2：内部变量或输入端口 → 模块内追踪
-        symbols = _trace_in_module(body, var_name)
+        symbols = _trace_in_module(body, member_path)
 
     # ── 4. 组装结果 ──────────────────────────────────────────────────
     driven = [_build_variable_info(s) for s in symbols]
@@ -116,17 +117,17 @@ def _is_port(body, var_name):
 # 内部函数：模块内追踪（情况 1 / 2）
 # ==============================================================================
 
-def _trace_in_module(body, var_name):
+def _trace_in_module(body, var_segments):
     """
     在模块内部追踪一个变量的一级扇出。
 
     两步：
-      A. 块扇出：找读取 var_name 的块，收集块内所有 LHS 变量
-      B. 子模块端口扇出：找由 var_name 驱动的子模块输入端口
+      A. 块扇出：找读取目标变量的块，收集块内所有 LHS 变量
+      B. 子模块端口扇出：找由目标变量驱动的子模块输入端口
 
     Args:
-        body:     InstanceBodySymbol
-        var_name: 要追踪的变量名
+        body:          InstanceBodySymbol
+        var_segments:  变量/字段路径段列表，如 ['cfg_reg'] 或 ['cfg_reg', 'baud', 'div']
 
     Returns:
         list[Symbol]: 被直接驱动的 AST Symbol 列表
@@ -137,14 +138,14 @@ def _trace_in_module(body, var_name):
     seen = set()  # 用 id() 去重
 
     # A. 块扇出
-    block_driven = _find_block_fanout(body, var_name, target_ci)
+    block_driven = _find_block_fanout(body, var_segments, target_ci)
     for s in block_driven:
         if id(s) not in seen:
             seen.add(id(s))
             symbols.append(s)
 
-    # B. 子模块端口扇出
-    port_driven = _find_input_port_fanout(body, var_name, target_ci)
+    # B. 子模块端口扇出（使用 var_segments[0] 作为简单变量名）
+    port_driven = _find_input_port_fanout(body, var_segments[0], target_ci)
     for s in port_driven:
         if id(s) not in seen:
             seen.add(id(s))
@@ -157,21 +158,27 @@ def _trace_in_module(body, var_name):
 # 内部函数：块内扇出扫描
 # ==============================================================================
 
-def _find_block_fanout(body, var_name, target_ci):
+def _find_block_fanout(body, var_segments, target_ci):
     """
-    扫描当前模块的 ProceduralBlock 和 ContinuousAssign，找到 var_name
+    扫描当前模块的 ProceduralBlock 和 ContinuousAssign，找到目标变量
     被读取的块，返回这些块中所有被赋值（LHS）的 Symbol。
 
-    算法（参考 trace_var._scan_block_variables_ast 的 Counter 计数法）：
-      1. 遍历 Assignment 节点：记录 .left Symbol → LHS 计数
-      2. 遍历 NamedValue 节点：记录 .symbol → 总引用计数（仅针对 var_name）
-      3. 若 var_name 的总引用 > LHS 出现次数 → 说明 var_name 在 RHS/条件中被读取
+    支持 NamedValue 和 MemberAccess（struct 字段访问）两种表达式。
+    对于 MemberAccess，收集链上所有符号（基变量 + 中间字段）。
+
+    算法（引用计数平衡法，参考 trace_var._scan_block_variables_ast）：
+      1. 遍历 Assignment 节点：记录 .left 链 → LHS 计数。匹配的 LHS 链
+         上每个符号（各级 MemberAccess 节点 + 链底基变量子节点）都会在
+         引用计数中被 visit 到，故 LHS 侧需按链长同步计入，避免字段
+         赋值块被误判为"读取了目标"
+      2. 遍历 NamedValue 和 MemberAccess 节点：记录引用计数（仅针对目标变量）
+      3. 若目标变量的总引用 > LHS 出现次数 → 说明在 RHS/条件中被读取
       4. 收集该块内所有 LHS Symbol 作为被驱动变量
 
     Args:
-        body:      InstanceBodySymbol
-        var_name:  目标变量名
-        target_ci: body.containingInstance，用于过滤直接块
+        body:          InstanceBodySymbol
+        var_segments:  变量/字段路径段列表，如 ['cfg_reg'] 或 ['cfg_reg', 'baud', 'div']
+        target_ci:     body.containingInstance，用于过滤直接块
 
     Returns:
         list[Symbol]: 被驱动变量 Symbol 列表
@@ -196,25 +203,35 @@ def _find_block_fanout(body, var_name, target_ci):
         def collect(node):
             nonlocal var_lhs_count, var_total_count
 
-            # 赋值表达式 → .left 是 LHS
+            # 赋值表达式 → .left 是 LHS（含 NamedValue 和 MemberAccess）
             if node.kind == ast.ExpressionKind.Assignment:
                 left = node.left if hasattr(node, 'left') else None
-                if left is not None and left.kind == ast.ExpressionKind.NamedValue:
-                    s = left.symbol if hasattr(left, 'symbol') else None
-                    if s is not None:
+                if left is not None:
+                    # 收集 LHS 符号
+                    chain = _collect_member_chain(left)
+                    for s in chain:
                         lhs_syms.add(s)
-                        if s.name == var_name:
-                            var_lhs_count += 1
+                    # 检查是否匹配目标变量
+                    if _match_variable(left, var_segments):
+                        # LHS 链上每个符号在引用计数中都会被 visit 到
+                        # （MemberAccess 节点 + 链底基变量子节点），
+                        # 按链长同步计入 LHS 侧
+                        var_lhs_count += len(chain)
 
-            # 变量引用
+            # 简单变量引用
             if node.kind == ast.ExpressionKind.NamedValue:
                 s = node.symbol if hasattr(node, 'symbol') else None
-                if s is not None and s.name == var_name:
+                if s is not None and s.name == var_segments[0]:
+                    var_total_count += 1
+
+            # struct 字段访问引用
+            if node.kind == ast.ExpressionKind.MemberAccess:
+                if _match_variable(node, var_segments):
                     var_total_count += 1
 
         sym.visit(collect)
 
-        # var_name 出现在块的 RHS / 条件中（不仅是 LHS）
+        # 目标变量出现在块的 RHS / 条件中（不仅是 LHS）
         if var_total_count > var_lhs_count:
             driven.extend(lhs_syms)
 

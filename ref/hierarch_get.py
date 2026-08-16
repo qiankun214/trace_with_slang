@@ -77,10 +77,14 @@ def find_variable_paths(hierarchy, target_file, var_name):
     再对每条路径通过 AST body.find() 判断变量是否存在，若存在则拼接
     完整的层次变量路径。
 
+    支持 struct 字段路径：var_name 可包含 '.' 分隔的字段路径
+    （如 "cfg_reg.baud.div"），首段通过 body.find() 查找基变量，
+    后续段通过 struct type scope 逐级查找字段。
+
     Args:
         hierarchy:   extract_hierarchy() 返回的 dict[str, dict]
         target_file: 目标 SV 源文件路径（相对或绝对）
-        var_name:    要查找的变量名
+        var_name:    要查找的变量名，可含 struct 字段路径（如 "cfg_reg.baud.div"）
 
     Returns:
         list[str]: 形如 ['alu_system.u_core.u_adder.sum'] 的变量层次路径列表。
@@ -89,6 +93,11 @@ def find_variable_paths(hierarchy, target_file, var_name):
     inst_paths = find_instance_paths_for_file(hierarchy, target_file)
     if not inst_paths:
         return []
+
+    # 拆分 var_name: 首段为基变量名，后续段为 struct 字段路径
+    segments = var_name.split('.')
+    base_name = segments[0]
+    field_path = segments[1:]
 
     result = []
     for inst_path in inst_paths:
@@ -100,9 +109,26 @@ def find_variable_paths(hierarchy, target_file, var_name):
         if body is None:
             continue
 
-        # 通过 AST 查找变量符号
-        symbol = body.find(var_name)
-        if symbol is not None:
+        # 通过 AST 查找基变量
+        symbol = body.find(base_name)
+        if symbol is None:
+            continue
+
+        # 遍历 struct 字段路径
+        found = True
+        for field_name in field_path:
+            struct_scope = symbol.type
+            if hasattr(struct_scope, 'canonicalType') and struct_scope.canonicalType is not None:
+                struct_scope = struct_scope.canonicalType
+            if struct_scope is None or not hasattr(struct_scope, 'find'):
+                found = False
+                break
+            symbol = struct_scope.find(field_name)
+            if symbol is None:
+                found = False
+                break
+
+        if found:
             var_path = f"{inst_path}.{var_name}"
             result.append(var_path)
 

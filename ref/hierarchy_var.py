@@ -64,43 +64,82 @@ def find_hierarch_var(hierarchy, var_path):
     """
     通过层次路径查找 elaborated 变量符号，返回变量信息。
 
-    解析 var_path（如 "alu_system.u_core.add_sum"），在 hierarchy dict
+    解析 var_path（如 "alu_system.u_core.add_sum" 或
+    "csr_system.u_regfile.cfg_reg.baud.div"），在 hierarchy dict
     中查找对应的 InstanceBodySymbol，再用 AST body.find() 解析变量符号。
+    支持 struct 字段路径：实例路径之后的剩余段逐级通过 struct type scope 查找。
 
     Args:
         hierarchy: extract_hierarchy() 返回的 dict[str, dict]，
                    key 为 hierarchicalPath，value 含 'ast' (InstanceBodySymbol)
-        var_path:  层次变量路径，点分隔，格式为 <顶层模块>.<实例>.<变量名>
+        var_path:  层次变量路径，点分隔，格式为 <顶层模块>.<实例>.<变量>[.<字段>...]
 
     Returns:
-        dict: {name, type_name, bit_width, kind, hierarchical_path, instance_path}
+        dict: {name, member_path, type_name, bit_width, kind,
+               hierarchical_path, instance_path}
 
     Raises:
         ValueError: 路径格式错误、实例路径不存在或变量未找到时
     """
-    # ── 1. 解析路径 ─────────────────────────────────────────────
+    # ── 1. 解析路径：从右向左尝试实例路径匹配 ─────────────────
     segments = var_path.split('.')
     if len(segments) < 2:
         raise ValueError(
             f"层次变量路径至少需要两段 (顶层模块.变量名)，得到: {var_path}"
         )
 
-    var_name = segments[-1]
-    inst_path = '.'.join(segments[:-1])
+    # 从最长可能实例路径开始尝试 (至少保留 1 段作为变量/字段名)
+    # 只有当剩余段能成功解析时才接受该候选
+    inst_path = None
+    var_segments = None
+    resolved_symbol = None
+    first_failed_inst = None  # 记录第一个有层次但解析失败的实例路径
+    for i in range(len(segments) - 1, 0, -1):
+        candidate_inst = '.'.join(segments[:i])
+        if candidate_inst not in hierarchy:
+            continue
+        # 尝试解析剩余的变量/字段段
+        candidate_vars = list(segments[i:])
+        body = hierarchy[candidate_inst]['ast']
+        sym = body.find(candidate_vars[0])
+        # body.find() 可能返回 InstanceSymbol (子模块)，需排除
+        if sym is None or sym.kind == ast.SymbolKind.Instance:
+            # 仅当剩余段只有变量名（而非中间实例名）时记录"未找到"错误
+            if len(candidate_vars) == 1 and first_failed_inst is None:
+                first_failed_inst = (candidate_inst, candidate_vars[0])
+            continue  # 基变量未找到或匹配到实例名，尝试更短的实例路径
+        # 遍历后续字段段
+        ok = True
+        for field_name in candidate_vars[1:]:
+            struct_scope = sym.type
+            if hasattr(struct_scope, 'canonicalType') and struct_scope.canonicalType is not None:
+                struct_scope = struct_scope.canonicalType
+            if struct_scope is None or not hasattr(struct_scope, 'find'):
+                ok = False
+                break
+            sym = struct_scope.find(field_name)
+            if sym is None:
+                ok = False
+                break
+        if ok:
+            inst_path = candidate_inst
+            var_segments = candidate_vars
+            resolved_symbol = sym
+            break
 
-    # ── 2. 查找实例 body ────────────────────────────────────────
-    entry = hierarchy.get(inst_path)
-    if entry is None:
-        raise ValueError(f"层次路径不存在: {inst_path}")
+    if inst_path is None:
+        # 区分子错误：有层次但变量未找到 vs 层次路径不存在
+        if first_failed_inst is not None:
+            failed_inst, failed_var = first_failed_inst
+            raise ValueError(f"变量 '{failed_var}' 在 '{failed_inst}' 中未找到")
+        raise ValueError(f"层次路径不存在: {var_path}")
 
+    symbol = resolved_symbol
+    entry = hierarchy[inst_path]
     body = entry['ast']  # InstanceBodySymbol
 
-    # ── 3. 查找变量符号 ─────────────────────────────────────────
-    symbol = body.find(var_name)
-    if symbol is None:
-        raise ValueError(f"变量 '{var_name}' 在 '{inst_path}' 中未找到")
-
     # ── 4. 提取类型 / 位宽 / 种类 ───────────────────────────────
+    var_name = var_segments[-1]
     if hasattr(symbol, 'type') and symbol.type is not None:
         type_name = str(symbol.type)
         bit_width = (
@@ -119,6 +158,7 @@ def find_hierarch_var(hierarchy, var_path):
 
     return {
         'name': var_name,
+        'member_path': var_segments,  # ['cfg_reg'] 或 ['cfg_reg', 'baud', 'div']
         'type_name': type_name,
         'bit_width': bit_width,
         'kind': kind_label,
