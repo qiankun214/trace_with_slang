@@ -180,7 +180,8 @@ class TestTraceVariable:
         assert result["assignment"]["instance_name"] == "u_result"
 
     def test_追踪输入端口连接u_adder_b(self, filelist_path):
-        """u_adder.b — port_connection，由 add_b_mux 驱动。"""
+        """u_adder.b — port_connection，驱动信号是父模块的 add_b_mux，
+        不属于本模块赋值块内的变量 → related_variables 为空。"""
         result = trace_variable(filelist_path, "alu_system.u_core.u_adder.b")
 
         assert result["variable"]["name"] == "b"
@@ -189,9 +190,8 @@ class TestTraceVariable:
         assert result["assignment"]["definition_name"] == "adder_8bit"
         assert "adder_8bit u_adder" in result["assignment"]["source_text"]
 
-        related_names = {v["name"] for v in result["related_variables"]}
-        assert "add_b_mux" in related_names, (
-            f"缺少 add_b_mux，实际: {related_names}"
+        assert result["related_variables"] == [], (
+            f"输入端口应无相关变量，实际: {result['related_variables']}"
         )
 
     def test_追踪输入端口连接u_adder_a(self, filelist_path):
