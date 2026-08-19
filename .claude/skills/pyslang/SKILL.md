@@ -177,6 +177,42 @@ elif port_header.kind == SK.VariablePortHeader:
 #   端口连接通过 member.instances 对应的 AST InstanceSymbol.portConnections 获取
 ```
 
+### 2.8 StatementKind 语句节点（AST 层，已验证 pyslang 11.0.0）
+
+语句节点的 `.kind` 是 `StatementKind` 枚举（不是 SymbolKind！）。`visit()` 会遍历到
+语句节点及嵌套的表达式节点。语句节点直接暴露结构属性，可用于"条件门控"分析：
+
+```python
+SK = ast.StatementKind
+
+SK.Conditional   # if / else if / else
+                 # 属性: .conditions (list[ConditionalStatement.Condition],
+                 #       每个 Condition 有 .expr 条件表达式、.pattern)
+                 #       .ifTrue / .ifFalse (分支语句，可为 None)
+SK.Case          # case / casez / casex
+                 # 属性: .expr (选择表达式)、.items (list[CaseItem]，
+                 #       每个 CaseItem 有 .expressions 模式列表、.stmt 分支语句)、
+                 #       .defaultCase (默认分支，可为 None)
+SK.ForLoop       # for 循环（注意：没有 Loop 枚举，for 是 ForLoop！）
+                 # 属性: .stopExpr (循环条件)、.body (循环体)、
+                 #       .initializers / .steps / .loopVars
+SK.Timed         # @(posedge clk) 等事件控制
+                 # 属性: .timing (TimingControlKind，如 SignalEvent，内含事件表达式)、
+                 #       .stmt (被门控的主体语句)
+SK.Block         # begin...end 块
+SK.ExpressionStatement  # 表达式语句（内嵌 Assignment 等）
+```
+
+**用途示例**：判断"赋值语句被哪些条件门控"——遍历语句树，对每个 `Conditional`/
+`Case`/`ForLoop`/`Timed` 节点，把其条件表达式（`.conditions[i].expr` / `.expr` /
+`.stopExpr` / `.timing`）广播给分支子树（`.ifTrue`/`.ifFalse`/`.items[i].stmt`/
+`.body`/`.stmt`）内的所有 `Assignment` 节点。嵌套条件自动累积（外层分支子树包含
+内层 if 的分支）。
+
+**注意**：`visit()` 是前序 DFS 无退出回调，无法靠遍历顺序判断"当前在哪个分支里"；
+必须用属性直取条件表达式。pybind11 每次访问表达式节点会新建 Python wrapper
+（`id()` 不稳定），不要用 `id(表达式节点)` 做跨遍历关联的键（符号 Symbol 可以）。
+
 ---
 
 ## 3. AST API
@@ -276,6 +312,8 @@ EK.NamedValue        # 变量/信号引用
                      # 属性: .symbol → VariableSymbol/NetSymbol（已解析类型/位宽/路径）
 EK.UnaryOp           # 一元运算
 EK.BinaryOp          # 二元运算
+EK.ConditionalOp     # 三元运算符 (a ? b : c)
+                     # 属性: visit() 会穿透到三个操作数（选择符 + 两个分支）
 EK.IntegerLiteral    # 整数常量
 EK.Conversion        # 类型转换
 EK.EmptyArgument     # 空参数（端口连接中输出端口 RHS 常见）
@@ -1153,6 +1191,7 @@ def find_input_port_connection(body, var_name):
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.4.2 | 2026-08-16 | 新增：2.8 StatementKind 语句节点（Conditional/Case/ForLoop/Timed 结构属性、语句节点无 Loop 枚举、pybind11 表达式节点 id 不稳定）；3.3 ExpressionKind 补充 ConditionalOp（三元运算符，visit 穿透三操作数）| 
 | 1.4.1 | 2026-07-30 | 完善：3.5 ArgumentDirection — 明确枚举值列表和直接比较模式（区分 DIRECTION_MAP 仅用于显示）；5 新增「已验证的编码最佳实践」— hasattr 防御性属性访问、id(symbol) 去重（name 不能去重的原因）|
 | 1.4.0 | 2026-07-30 | 新增：ExpressionKind 枚举（Assignment/NamedValue 等）和 ProceduralBlockKind 枚举（3.3）；编码模式 4.5 AST 块内变量扫描 — LHS-only 排除算法（Counter 计数法）；4.6 查找赋值块 — parentScope.containingInstance 过滤子实例穿透；4.7 端口连接追踪 — 输入/输出端口双向、HierarchyInstantiation 源文本提取、子模块端口变量获取；新发现 — visit() 穿透子实例、body.containingInstance 类型纠正（InstanceBodySymbol vs InstanceSymbol）、inst.syntax.parent 获取完整实例化 CST |
 | 1.3.0 | 2026-07-30 | 新增：端口连接表达式结构（3.9.1.1）— 输入/输出端口的 Expression 结构差异与扇出追踪方法；编码模式 4.4 变量扇出追踪 — 三类信号分类、块扇出、输入端口扇出、输出端口向上追溯；PortSymbol 补充 — findPort()、internalSymbol；确认 API 区分 — find() vs findPort()、输入/输出端口连接表达式结构不同 |
