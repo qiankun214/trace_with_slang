@@ -10,21 +10,63 @@
 > 指向 port_connection 块;port/内部变量同 full_path 合并为一行),
 > §3.1 isCompound/自增自减、§3.2 数组 Select、§3.3 port_connection 归属、
 > §3.4 共享编译私有层均已按实测落实。
+> 二次修订:DepEdge 与 BlockInfo 的对应改为**显式对象绑定**
+> (`DepEdge.block: BlockInfo | None`),取消 `(block_instance_path, block_index)`
+> 键对隐式约定;块因无源语法被跳过时 `block=None` 兜底。
 
 ## 1. 输入 / 输出
 
+### 1.1 总览
+
+```
+流程①输出(.sv 文件绝对路径列表 list[str])
+   │
+   ▼
+extract_design(sv_files)   ── 一次性编译 + 提取 ──▶  ParseResult(纯数据)
+   │                                                    │ instances / signals
+   │                                                    │ blocks / dep_edges
+   ▼                                                    ▼
+(Compilation/Symbol/SourceManager 止于流程②内部)    流程③(build_db)输入
+```
+
 - **输入**:流程①的输出 — `.sv` 文件**绝对路径**列表 `list[str]`
   (含 `-v`/`-y` 引入的库文件;空列表是合法输入)
-- **输出**:`ParseResult`(dataclass),纯数据、不含任何 pyslang AST 对象
-  (`Compilation`/`Symbol`/`SourceManager` 生命周期止于流程②内部),含四组信息:
-  - `instances`: 实例层次树(见 §1.1)
-  - `signals`:   信号(变量/网络/参数/端口/struct 字段,见 §1.2)
-  - `blocks`:    完整赋值语句块(见 §1.3)
-  - `dep_edges`: 依赖边(见 §1.4)
-- **一级函数**:`extract_design(sv_files: list[str]) -> ParseResult`
-  (同时公开四个分组提取函数,供单独复用,见 §3)
+- **输出**:`ParseResult`(dataclass,§1.3),**纯数据、不含任何 pyslang AST
+  对象**(`Compilation`/`Symbol`/`SourceManager` 生命周期止于流程②内部),
+  含四组信息:`instances` 实例层次树 / `signals` 信号 / `blocks` 赋值语句块 /
+  `dep_edges` 依赖边
+- 流程②**功能**:把 SV 源码编译成可查询的事实数据 —— 谁是谁的实例、
+  每个信号的类型与位置、每个赋值块的内容、每个"谁读谁/谁驱动谁"的依赖边
 
-### 1.1 InstanceInfo(实例层次树)
+### 1.2 公开函数清单(5 个)
+
+| 函数(签名) | 输入 | 输出 | 功能 |
+|---|---|---|---|
+| `extract_design(sv_files: list[str]) -> ParseResult` | .sv 绝对路径列表(可为空) | ParseResult(§1.3) | **一级函数**:编译全部文件,一次性提取四组信息(共享一次编译) |
+| `extract_hierarchy(sv_files: list[str]) -> list[InstanceInfo]` | 同上 | 实例层次树列表 | 只提取实例层次(§1.4) |
+| `extract_signals(sv_files: list[str]) -> list[SignalInfo]` | 同上 | 信号列表 | 只提取信号,含 struct 字段展开(§1.5) |
+| `extract_blocks(sv_files: list[str]) -> list[BlockInfo]` | 同上 | 赋值语句块列表 | 只提取赋值块(§1.6) |
+| `extract_dep_edges(sv_files: list[str]) -> list[DepEdge]` | 同上 | 依赖边列表 | 只提取依赖边(§1.7) |
+
+- 输入必须已通过流程①(绝对路径、存在性已校验);四个公开分组函数
+  **各自独立编译一次**(独立复用优先,大设计勿混用),`extract_design`
+  内部共享一次编译(§2/§3)
+
+### 1.3 输出总结构:ParseResult
+
+```python
+@dataclass
+class ParseResult:
+    instances: list[InstanceInfo]  # 实例层次树(§1.4),每处实例化一条
+    signals:   list[SignalInfo]    # 全部信号行(§1.5),按 full_path 唯一
+    blocks:    list[BlockInfo]     # 赋值语句块(§1.6),含 port_connection 块
+    dep_edges: list[DepEdge]       # 依赖边(§1.7),显式绑定块对象
+```
+
+- 四组列表均为纯数据;空输入 → 四个空列表
+- 产出顺序确定、可复现(§4),该顺序即流程③建库的插入顺序
+
+### 1.4 InstanceInfo(实例层次树)
 
 ```python
 @dataclass
@@ -49,7 +91,7 @@ class InstanceInfo:
 - 缺失子模块定义 → 符号退化为 `SymbolKind.UninstantiatedDef`,**不**产出 InstanceInfo
   (告警见 §7);`depth` 由 `hierarchicalPath` 段数计算
 
-### 1.2 SignalInfo(信号)
+### 1.5 SignalInfo(信号)
 
 ```python
 @dataclass
@@ -88,7 +130,7 @@ class SignalInfo:
   外键解析均无二义),重复 full_path 由本流程合并,不推给流程③
 - 枚举默认值 (`EnumValue`)、genvar 等非信号符号不展开
 
-### 1.3 BlockInfo(赋值语句块)
+### 1.6 BlockInfo(赋值语句块)
 
 ```python
 @dataclass
@@ -111,25 +153,25 @@ class BlockInfo:
   每处模块实例化语句(`inst.syntax.parent`)产出一条 `'port_connection'` 块
   (源文本即实例化语句,供跨模块依赖边引用)
 - `instance_path` 归属:普通块 = 块所在模块实例;`port_connection` 块 =
-  **父实例**(实例化语句位于父模块)。dep 边的 `block_instance_path` 与
-  块同键同规则(§6.2)
+  **父实例**(实例化语句位于父模块)。dep 边经 `block` 对象引用绑定本块,
+  归属信息随块对象获得(§1.7)
 - 行范围与源文本:`ast_symbol.syntax.sourceRange` → SourceManager 行号;
   `ContinuousAssign.syntax` 实测为 `AssignmentExpression`,其 `sourceRange`
   已覆盖完整 `assign ...;` 语句;行号 1-indexed,截取为含首尾行的文本
-- `index` 为全局稳定序号(全列表遍历序,自 0 递增),`dep_edges` 以
-  `(block_instance_path, index)` 引用块,不引用流程③才分配的数据库 id;
-  流程③可将 `index` 直接用作 blocks 表行 id(见 §9)
+- `index` 为全局稳定序号(全列表遍历序,自 0 递增),流程③可将其直接用作
+  blocks 表行 id(见 §9);`dep_edges` 经**对象引用**显式绑定本块(§1.7),
+  不依赖键匹配
 
-### 1.4 DepEdge(依赖边)
+### 1.7 DepEdge(依赖边)
 
 ```python
 @dataclass
 class DepEdge:
     driven_signal: str             # 被驱动信号 full_path(即 LHS)
     read_signal: str               # 被读取信号 full_path(即 RHS/条件)
-    block_instance_path: str       # 边所在块(或端口连接)的实例路径,与 BlockInfo.instance_path
-                                   # 同规则(port_connection 边取父实例)
-    block_index: int               # 所在块的全局 index(port_connection 边引用其块 index)
+    block: BlockInfo | None        # 显式绑定产生这条边的块对象:块内边 = 所在块;
+                                   # 端口连接边 = 该实例化语句的 port_connection 块(归属父实例);
+                                   # 该块因无源语法被跳过时为 None(§5 规则 8)
     is_condition: bool             # 门控条件读(通道2);RHS 读(通道1)为 False
     is_port_conn: bool             # 跨模块端口连接边;块内依赖边为 False
 ```
@@ -140,7 +182,79 @@ class DepEdge:
      (`is_port_conn=True`,见 §6.2)
   3. **输出端口连接**:子模块输出端口内部信号 → 父模块被驱动信号
      (`is_port_conn=True`,见 §6.2)
+- 绑定关系以**对象引用**为准:`block` 即 `ParseResult.blocks` 列表中的同一
+  BlockInfo 对象(纯数据,不含 pyslang 对象),流程③按对象身份解析
+  block_id(§9);序列化导出时按对象身份去重,或改用 `block.index` 输出
 - 边的两端引用信号 `full_path`(流程③再解析为信号 id)
+
+### 1.8 完整示例
+
+以单文件设计展示一次 `extract_design` 的输入与输出(按本规格推演,
+实现后以 pytest 固化):
+
+```systemverilog
+// mini.sv
+module mini (
+    input  logic        clk,
+    input  logic [3:0]  a,
+    output logic [3:0]  y
+);
+    logic [3:0] b;
+
+    assign y = a & b;                       // 块 0
+    always_ff @(posedge clk) b <= a;        // 块 1
+endmodule
+```
+
+输入:`['/abs/path/mini.sv']`,输出 `ParseResult`(节选渲染):
+
+```python
+ParseResult(
+  instances=[
+    InstanceInfo(path='mini', name='mini', module_name='mini', depth=1,
+                 file='/abs/path/mini.sv',
+                 ports=[PortInfo(name='clk', direction='input', bit_width=1),
+                        PortInfo(name='a', direction='input', bit_width=4),
+                        PortInfo(name='y', direction='output', bit_width=4)]),
+  ],
+  signals=[
+    SignalInfo(instance_path='mini', full_path='mini.clk', name='clk',
+               type_name='logic', bit_width=1, kind='port', is_port=True,
+               direction='input', definition_file='/abs/path/mini.sv',
+               definition_line=3),
+    # 'mini.a'、'mini.y' 同构(kind='port')
+    SignalInfo(instance_path='mini', full_path='mini.b', name='b',
+               type_name='logic[3:0]', bit_width=4, kind='variable',
+               is_port=False, direction='', definition_file='/abs/path/mini.sv',
+               definition_line=7),
+  ],
+  blocks=[
+    BlockInfo(instance_path='mini', index=0, block_type='assign',
+              source_file='/abs/path/mini.sv', start_line=9, end_line=9,
+              source_text='    assign y = a & b;'),
+    BlockInfo(instance_path='mini', index=1, block_type='always_ff',
+              source_file='/abs/path/mini.sv', start_line=10, end_line=10,
+              source_text='    always_ff @(posedge clk) b <= a;'),
+  ],
+  dep_edges=[
+    DepEdge(driven_signal='mini.y', read_signal='mini.a',
+            block=blocks[0], is_condition=False, is_port_conn=False),  # 通道1:RHS 读
+    DepEdge(driven_signal='mini.y', read_signal='mini.b',
+            block=blocks[0], is_condition=False, is_port_conn=False),  # 通道1:RHS 读
+    DepEdge(driven_signal='mini.b', read_signal='mini.a',
+            block=blocks[1], is_condition=False, is_port_conn=False),  # 通道1:RHS 读
+    DepEdge(driven_signal='mini.b', read_signal='mini.clk',
+            block=blocks[1], is_condition=True,  is_port_conn=False),  # 通道2:@(posedge clk) 门控
+  ],
+)
+```
+
+要点:
+
+- 端口行与同名内部变量合并:clk/a/y 各只有一行(`kind='port'`)
+- 边显式绑定块对象(`block=blocks[0]`/`blocks[1]`),同一块可产生多条边
+- `@(posedge clk)` 的门控读走通道 2,`is_condition=True`
+- 本示例无子模块实例,`port_connection` 块与 `is_port_conn` 边见 §6.2
 
 ## 2. 整体处理流程
 
@@ -172,10 +286,10 @@ class DepEdge:
 流程③(build_db)的输入
 ```
 
-顺序要求:层次/信号/块先行(依赖边需要 `(instance_path, index)` 块键与
-信号 full_path 映射);`extract_design` 内部调用**共享编译的私有实现**
-`_extract_*_impl`(§3),只编译一次;公开 `extract_*` 各自独立编译,
-见 §3 设计依据。
+顺序要求:层次/信号/块先行(依赖边需要绑定 `ParseResult.blocks` 中的
+BlockInfo 对象,并对照信号 full_path 映射);`extract_design` 内部调用
+**共享编译的私有实现** `_extract_*_impl`(§3),只编译一次;公开
+`extract_*` 各自独立编译,见 §3 设计依据。
 
 ## 3. 子函数规划
 
@@ -189,7 +303,7 @@ class DepEdge:
 | `_extract_hierarchy_impl`(私有) | `root, sm` | `list[InstanceInfo]` | 层次提取实现(共享编译,公开版内部调用) |
 | `_extract_signals_impl`(私有) | `root, sm` | `list[SignalInfo]` | 信号提取实现(共享编译) |
 | `_extract_blocks_impl`(私有) | `root, sm` | `list[BlockInfo]` | 块提取实现(共享编译) |
-| `_extract_dep_edges_impl`(私有) | `root, sm, blocks, signals` | `list[DepEdge]` | 依赖提取实现(共享编译,依赖块键与信号表) |
+| `_extract_dep_edges_impl`(私有) | `root, sm, blocks, signals` | `list[DepEdge]` | 依赖提取实现(共享编译,边直接绑定传入 blocks 列表中的 BlockInfo 对象并对照信号表;`blocks` 必须是最终放入 ParseResult 的同一份列表) |
 | `_build_compilation`(私有) | `sv_files: list[str]` | `(Compilation, RootSymbol, SourceManager)` | 单次编译全部文件并 elaborate |
 | `_report_diagnostics`(私有) | `Compilation` | `None` | 统计 ERROR/WARNING 计数并 log |
 | `_collect_instances`(私有) | `RootSymbol` | `list[InstanceSymbol]` | visit 收集 InstanceSymbol(DFS 前序) |
@@ -211,26 +325,18 @@ class DepEdge:
 `_extract_*_impl` 私有实现(`extract_design` **不得**调用公开 extract_*,
 否则重复编译 4 次)。单一职责、输入/输出类型明确;主函数只做编排。
 
-## 4. 数据模型(ParseResult)
+## 4. 产出顺序与流程③映射
 
-```python
-@dataclass
-class ParseResult:
-    instances: list[InstanceInfo]  # 实例层次树
-    signals:   list[SignalInfo]    # 全部信号行(含 struct 字段展开)
-    blocks:    list[BlockInfo]     # 赋值语句块(含 port_connection)
-    dep_edges: list[DepEdge]       # 依赖边
-```
-
-- 四组信息都按**确定顺序**产出:instances 按 DFS 前序;signals 按实例序 →
-  成员声明序 → struct 字段序;blocks 按实例序 → 遍历序 → port_connection
-  **列最后**;dep_edges 按块序,端口连接边最后(保证结果可复现)
+- 四组信息都按**确定顺序**产出(保证结果可复现):instances 按 DFS 前序;
+  signals 按实例序 → 成员声明序 → struct 字段序;blocks 按实例序 →
+  遍历序 → port_connection **列最后**;dep_edges 按块序,端口连接边最后
 - 流程③以此四列表为输入建库(表设计 doc/ref.md §7.1):
   `instances` 表 ← `ParseResult.instances`(parent_id 由流程③按 path 前缀推导);
   `signals` 表 ← `ParseResult.signals`(instance_id 按 instance_path 解析);
   `blocks` 表 ← `ParseResult.blocks`(instance_id 按 instance_path 解析,
   id 与 index 对应);`dep_edges` 表 ← `ParseResult.dep_edges`
-  (信号 id 按 full_path 解析,block_id 按 `(instance_path, index)` 解析)
+  (信号 id 按 full_path 解析;block_id 按边持有的 BlockInfo 对象身份解析,
+  `block=None` 时落 NULL)
 
 ## 5. 处理规则
 
@@ -250,7 +356,7 @@ class ParseResult:
    'input'/'output'/'inout'/'ref';`bit_width` 一律取 `type.bitWidth`
    属性(无 `getBitstreamWidth()` 之类方法);`definition_file/line` 取
    符号 `location` 经 SourceManager 映射(字段行例外,见规则 6);
-   同 `full_path` 的 port 行与 variable 行合并为一行(规则见 §1.2),
+   同 `full_path` 的 port 行与 variable 行合并为一行(规则见 §1.5),
    信号表按 `full_path` 唯一
 6. struct 字段展开:`canonicalType`(带 `isStruct` 判定)经 `visit()` 收集
    `SymbolKind.Field` 直接字段;字段类型本身为 struct 时递归展开
@@ -259,16 +365,17 @@ class ParseResult:
    类型定义处,不作信号定义位置)
 7. 块:每实例 `body.visit()` 收集直接块,过滤条件
    `parentScope.containingInstance is 本实例 body`(visit 会穿透子实例,
-   必须过滤);`index` 为全列表递增序号;源文本行范围见 §1.3
+   必须过滤);`index` 为全列表递增序号;源文本行范围见 §1.6
 8. `port_connection` 块:按父实例枚举(遍历父实例的直接子 `InstanceSymbol`
-   时产出,归属父实例,§1.3),行范围取 `inst.syntax.parent.sourceRange`
+   时产出,归属父实例,§1.6),行范围取 `inst.syntax.parent.sourceRange`
    (`inst.syntax.parent` 可能为 None — 如无源语法的实例,跳过);
-   块排在所属(父)实例块列表末尾,index 连续
+   块排在所属(父)实例块列表末尾,index 连续;该块被跳过时,此实例的
+   端口连接边仍产出,`block=None`(§1.7)
 9. 依赖边按 §6 规则提取;`dep_edges` 两端必须引用已产出的信号 `full_path`
    (信号不在信号表中的边丢弃并 `logger.debug` 记录);LHS 无法解析为
    信号行(§6.3 全部规则不命中)时不产 driven 边,同样 `logger.debug` 记录
 10. 确定性:所有遍历按 pyslang 自然顺序;边按 (driven_signal, read_signal,
-    block_instance_path, block_index, is_condition, is_port_conn) 元组去重
+    block 对象身份, is_condition, is_port_conn) 元组去重
 
 ## 6. 依赖提取(核心)
 
@@ -329,10 +436,10 @@ class ParseResult:
 | `InOut`/`Ref` | 不在本次范围 | — | — | 告警跳过(见 §7) |
 
 - 每条连接一条边,`is_port_conn=True`,`is_condition=False`,
-  `(block_instance_path, block_index)` 指向该实例化语句的 `port_connection` 块
-- 归属:`port_connection` 块的 `instance_path` 与边的 `block_instance_path`
-  均记**父实例**路径(实例化语句位于父模块);子/父两侧信号 full_path
-  各自按所属实例解析(§1.3)
+  `block` 绑定该实例化语句的 `port_connection` 块(块因无源语法被跳过时
+  `block=None`,§5 规则 8)
+- 归属:`port_connection` 块的 `instance_path` 记**父实例**路径
+  (实例化语句位于父模块);子/父两侧信号 full_path 各自按所属实例解析(§1.6)
 - 连接表达式为 `NamedValue` 时取 `expr.symbol`(其 `hierarchicalPath` 实测为
   父实例内完整路径,可直接用);连接表达式为 `MemberAccess`(struct 端口字段)
   时按 §6.3 的 full_path 拼接规则解析
@@ -348,7 +455,7 @@ class ParseResult:
 - `NamedValue` 节点:其 `symbol.name` == 段[0] → 匹配
 - `MemberAccess` 链:自顶向下收集成员名 + 链底基名,与目标段**完整相等** → 匹配;
   目标只有基名(整 struct 追踪)时,链首匹配基名即命中
-- 命中后 `read_signal` = `instance_path + '.' + '.'.join(段)`(即 §1.2 的
+- 命中后 `read_signal` = `instance_path + '.' + '.'.join(段)`(即 §1.5 的
   full_path 拼接规则)
 - LHS 解析(`_collect_member_chain` 收集链后取驱动行):`NamedValue` LHS →
   驱动基变量行(整 struct 赋值 `cfg_reg <= '0` 即此情形,不扩展到字段,
@@ -409,10 +516,11 @@ class ParseResult:
 - 输出为纯数据 `ParseResult`:不含 pyslang 对象,流程③无需 import pyslang
 - 四列表的确定顺序即流程③建库的插入顺序(§4);`blocks.index` 对应
   blocks 表的行 id(流程③保证 index 即自增 id,或自行维护映射)
-- 依赖边引用信号 `full_path` 与块 `(instance_path, index)`,流程③据此解析
-  外键,解析失败即告警;端口连接边同样引用 `port_connection` 块的
-  `block_id`(非 NULL,`is_port_conn` 列区分边类型),ref.md §7.1 注释已按
-  此同步
+- 依赖边**显式持有块对象**:流程③插入 blocks 时以对象身份
+  (`id(BlockInfo)`)建立 块对象→行 id 映射,dep_edges 的 `block_id` 直接取
+  该映射(`block=None` 落 NULL,即 ref.md §7.1 的"无对应块兜底"),
+  **不存在块键解析失败的情形**;信号 `full_path` 解析失败仍告警并丢弃
+  该边;端口连接边的 `is_port_conn` 列区分边类型
 - 流程③表结构见 doc/ref.md §7.1(dep_edges 的 `is_condition` /
   `is_port_conn` 列由本流程的 `DepEdge` 标志填充)
 

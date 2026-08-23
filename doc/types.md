@@ -15,7 +15,7 @@
 | `PortInfo` | 实例端口信息 | `name` / `direction` / `bit_width` |
 | `SignalInfo` | 信号行(变量/网络/参数/端口/struct 字段;按 `full_path` 唯一,port 与同名内部变量合并为一行) | `instance_path` / `full_path` / `name` / `type_name` / `bit_width` / `kind` / `is_port` / `direction` / `definition_file` / `definition_line` |
 | `BlockInfo` | 完整赋值语句块(always/assign/port_connection,blocks 表行) | `instance_path` / `index`(全局块序号,作为 block 键) / `block_type` / `source_file` / `start_line` / `end_line` / `source_text` |
-| `DepEdge` | 依赖边(dep_edges 表行;driver/load 的共同数据源) | `driven_signal` / `read_signal`(full_path) / `block_instance_path` / `block_index` / `is_condition` / `is_port_conn` |
+| `DepEdge` | 依赖边(dep_edges 表行;driver/load 的共同数据源) | `driven_signal` / `read_signal`(full_path) / `block`(**显式绑定** BlockInfo 对象,可为 None) / `is_condition` / `is_port_conn` |
 
 ## 流程①(filelist 解析)
 
