@@ -259,8 +259,8 @@ def _find_assignment_fanout(block, var_segments):
 
 - 三元运算符：RHS 内（通道 1 覆盖）/ if 条件内（通道 2 覆盖）/ 嵌套三元（visit 递归穿透）——全部实测验证，零特殊代码
 - `?:` 三个操作数都算读取（语义正确：`d = a ? b : c` 依赖 a、b、c）
-- 数组 LHS `s[i] <= d`：`_collect_member_chain` 不支持 `Select` 表达式（既存局限，两个算法一样，可后续扩展）
-- 循环头 `i=0`/`i++` 是普通 Assignment，通道 1 处理；`i<n` 是 stopExpr，通道 2 广播给循环体
+- 数组 LHS `s[i] <= d`：本节 §5.3 代码未处理 `Select`（既有局限）；flow2_design_spec §6.3 已定稿——沿 `.value` 链剥离 Select 得基信号行、下标计入读取，实现以 flow2 为准
+- 循环头 `i=0` 是普通 Assignment，通道 1 处理；`i++` 实测是 UnaryOp（Postincrement）而非 Assignment，走隐式读+写自身的自依赖规则（flow2_design_spec §6.1）；`i<n` 是 stopExpr，通道 2 广播给循环体
 - 条件表达式里不会嵌 Assignment（SV 条件必须是布尔表达式），广播不会误命中
 - `posedge`/`negedge` 是 `TimingControlKind` 非 NamedValue，`_expr_reads_target` 自然忽略
 
@@ -329,7 +329,8 @@ CREATE TABLE dep_edges (
     id               INTEGER PRIMARY KEY,
     driven_signal_id INTEGER NOT NULL REFERENCES signals(id),  -- LHS
     read_signal_id   INTEGER NOT NULL REFERENCES signals(id),  -- RHS/条件/端口
-    block_id         INTEGER REFERENCES blocks(id),            -- NULL=端口连接边
+    block_id         INTEGER REFERENCES blocks(id),            -- 端口连接边指向其 port_connection 块
+                                                               -- (flow2_design_spec 定稿);NULL 仅为无对应块的兜底
     is_condition     INTEGER NOT NULL DEFAULT 0,  -- 1=门控条件读（通道2），0=RHS 读
     is_port_conn     INTEGER NOT NULL DEFAULT 0,  -- 1=跨模块端口穿透边
     UNIQUE (driven_signal_id, read_signal_id, block_id, is_condition, is_port_conn)
@@ -379,7 +380,7 @@ SELECT path FROM instances WHERE file LIKE '%alu_core.sv';
 
 1. **instances**：`extract_hierarchy()` 的 dict（path/module/file 都有；parent_id 用 `path.rsplit('.',1)` 反查）
 2. **signals**：遍历每个 instance 的 `body.syntax.members`（CST 声明遍历）+ `portList`；struct 字段按 `member_path` 展开成行
-3. **dep_edges**：对每个信号跑一次 trace 逻辑（**建议实现赋值级算法后再生成**，避免块级误报落库），批量 `executemany` + 事务
+3. **dep_edges**：按 flow2_design_spec §6 单遍块遍历 + 端口连接建边（赋值级，`is_condition` / `is_port_conn` 标志落库），批量 `executemany` + 事务
 
 ### 7.4 备选方案对比
 

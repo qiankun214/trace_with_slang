@@ -1,7 +1,7 @@
 ---
 name: pyslang
 description: This skill should be used when writing Python scripts that parse, analyze, or extract information from SystemVerilog files using the pyslang library. Covers CST (syntax tree), AST (elaborated symbol tree), type resolution, port/variable extraction, and source location mapping. Triggers on phrases like "pyslang", "用pyslang", "扫描SV", "提取端口", "SystemVerilog解析", "slang python", or when working with .sv file analysis tools.
-version: 1.4.1
+version: 1.4.3
 ---
 
 # pyslang API Reference & Coding Guide
@@ -308,10 +308,19 @@ SK.Subroutine        # 子例程 (function, task)
 EK = ast.ExpressionKind
 EK.Assignment        # 赋值（含阻塞 =、非阻塞 <=、复合 += 等）
                      # 属性: .left (LHS), .right (RHS), .isNonBlocking (bool), .isCompound (bool)
+                     # 实测: 复合赋值(+= 等) AST 不 desugar——.right 只含显式 RHS,
+                     # 隐式读 LHS 需自行补(isCompound=True 时把 LHS 基链计入读取)
 EK.NamedValue        # 变量/信号引用
                      # 属性: .symbol → VariableSymbol/NetSymbol（已解析类型/位宽/路径）
 EK.UnaryOp           # 一元运算
+                     # 实测: 自增/自减(i++/++i/i--/--i)是 UnaryOp 而非 Assignment
+                     # (UnaryOperator.Preincrement/Postincrement/Predecrement/Postdecrement),
+                     # 语义为隐式读+写操作数
 EK.BinaryOp          # 二元运算
+EK.ElementSelect     # 数组元素选择（读写两侧均出现）: .value (基表达式), .selector (下标)
+                     # LHS 数组写 s[i] <= d: 沿 .value 链剥离得到基信号行（元素不单独成行）;
+                     # 下标是读: LHS 的 .selector 中的 NamedValue 计入读取
+                     # 读侧 x = mem[addr]: visit() 自然穿透命中 mem/addr，无需特殊代码
 EK.ConditionalOp     # 三元运算符 (a ? b : c)
                      # 属性: visit() 会穿透到三个操作数（选择符 + 两个分支）
 EK.IntegerLiteral    # 整数常量
@@ -1191,6 +1200,7 @@ def find_input_port_connection(body, var_name):
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.4.3 | 2026-08-23 | 补充 ExpressionKind 实测:复合赋值(isCompound)不 desugar、隐式读 LHS 需自行补;自增/自减为 UnaryOp 非 Assignment;新增 ElementSelect(.value/.selector,数组 LHS 解基行、下标是读) |
 | 1.4.2 | 2026-08-16 | 新增：2.8 StatementKind 语句节点（Conditional/Case/ForLoop/Timed 结构属性、语句节点无 Loop 枚举、pybind11 表达式节点 id 不稳定）；3.3 ExpressionKind 补充 ConditionalOp（三元运算符，visit 穿透三操作数）| 
 | 1.4.1 | 2026-07-30 | 完善：3.5 ArgumentDirection — 明确枚举值列表和直接比较模式（区分 DIRECTION_MAP 仅用于显示）；5 新增「已验证的编码最佳实践」— hasattr 防御性属性访问、id(symbol) 去重（name 不能去重的原因）|
 | 1.4.0 | 2026-07-30 | 新增：ExpressionKind 枚举（Assignment/NamedValue 等）和 ProceduralBlockKind 枚举（3.3）；编码模式 4.5 AST 块内变量扫描 — LHS-only 排除算法（Counter 计数法）；4.6 查找赋值块 — parentScope.containingInstance 过滤子实例穿透；4.7 端口连接追踪 — 输入/输出端口双向、HierarchyInstantiation 源文本提取、子模块端口变量获取；新发现 — visit() 穿透子实例、body.containingInstance 类型纠正（InstanceBodySymbol vs InstanceSymbol）、inst.syntax.parent 获取完整实例化 CST |

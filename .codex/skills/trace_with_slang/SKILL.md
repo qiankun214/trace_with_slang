@@ -1,7 +1,7 @@
 ---
 name: trace_with_slang
 description: This skill should be used when developing or refactoring the trace_with_slang project itself — the SystemVerilog trace analysis tool (pyslang parse → sqlite → API). Covers the project's architecture design (4-flow pipeline with strict input/output chaining), the four core features (variable info, assignment blocks, trace load, trace driver), doc structure, and coding conventions. Triggers on phrases like "trace_with_slang", "本项目", "本库", "架构设计", "重构", "开发本项目" or when planning work in src/.
-version: 1.0.2
+version: 1.0.3
 ---
 
 # trace_with_slang — 项目知识与架构设计

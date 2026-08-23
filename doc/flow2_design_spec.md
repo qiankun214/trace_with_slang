@@ -6,6 +6,10 @@
 > 算法原理与实例推演见 `doc/ref.md` §3(读/写判定)与 §5(赋值级依赖算法),
 > pyslang API 用法见 pyslang skill(pybind11 防御性访问、id(symbol) 去重等约定)。
 > 日志统一经 loguru 打印(错误 `logger.error` / 告警 `logger.warning`)。
+> 2026-08-23 按 doc/review.md 评审意见修订:§2.1/§2.2 契约矛盾定稿(block_id
+> 指向 port_connection 块;port/内部变量同 full_path 合并为一行),
+> §3.1 isCompound/自增自减、§3.2 数组 Select、§3.3 port_connection 归属、
+> §3.4 共享编译私有层均已按实测落实。
 
 ## 1. 输入 / 输出
 
@@ -76,8 +80,12 @@ class SignalInfo:
   — 如 `csr_pkg.baud` — 不可直接使用,必须拼接构造)
 - 基变量与字段**都**是一条信号行(整 struct 赋值 `cfg_reg <= '0` 的
   被驱动信号就是基变量行)
-- 变量存在多行映射(如 `input clk` 既是 port 行,内部变量 `clk` 又是
-  variable 行):如实产出,去重/合并属流程③职责
+- 同 `full_path` 的 port 行与 variable 行**合并为一行**(ANSI 同名端口的
+  常态,端口名 = 内部变量名):`kind='port'`、`is_port=True`、`direction`
+  取端口方向,`name`/`type_name`/`bit_width` 取变量符号;端口名与内部
+  变量名不同(非 ANSI 端口)时 full_path 不同,如实产出两行
+- **信号表按 `full_path` 唯一**:流程③直接依赖此保证(UNIQUE 约束与
+  外键解析均无二义),重复 full_path 由本流程合并,不推给流程③
 - 枚举默认值 (`EnumValue`)、genvar 等非信号符号不展开
 
 ### 1.3 BlockInfo(赋值语句块)
@@ -102,6 +110,9 @@ class BlockInfo:
 - `block_type`:ProceduralBlock 按 `procedureKind` 映射;ContinuousAssign → `'assign'`;
   每处模块实例化语句(`inst.syntax.parent`)产出一条 `'port_connection'` 块
   (源文本即实例化语句,供跨模块依赖边引用)
+- `instance_path` 归属:普通块 = 块所在模块实例;`port_connection` 块 =
+  **父实例**(实例化语句位于父模块)。dep 边的 `block_instance_path` 与
+  块同键同规则(§6.2)
 - 行范围与源文本:`ast_symbol.syntax.sourceRange` → SourceManager 行号;
   `ContinuousAssign.syntax` 实测为 `AssignmentExpression`,其 `sourceRange`
   已覆盖完整 `assign ...;` 语句;行号 1-indexed,截取为含首尾行的文本
@@ -116,13 +127,14 @@ class BlockInfo:
 class DepEdge:
     driven_signal: str             # 被驱动信号 full_path(即 LHS)
     read_signal: str               # 被读取信号 full_path(即 RHS/条件)
-    block_instance_path: str       # 边所在块(或端口连接)的实例路径
+    block_instance_path: str       # 边所在块(或端口连接)的实例路径,与 BlockInfo.instance_path
+                                   # 同规则(port_connection 边取父实例)
     block_index: int               # 所在块的全局 index(port_connection 边引用其块 index)
     is_condition: bool             # 门控条件读(通道2);RHS 读(通道1)为 False
     is_port_conn: bool             # 跨模块端口连接边;块内依赖边为 False
 ```
 
-- 依赖边是 driver/load 的共同数据源(§6.2),三个来源:
+- 依赖边是 driver/load 的共同数据源(§6.4),三个来源:
   1. **块内赋值**:赋值级算法两通道(见 §6.1,`is_condition=False/True`)
   2. **输入端口连接**:父模块信号 → 子模块输入端口内部信号
      (`is_port_conn=True`,见 §6.2)
@@ -161,8 +173,9 @@ class DepEdge:
 ```
 
 顺序要求:层次/信号/块先行(依赖边需要 `(instance_path, index)` 块键与
-信号 full_path 映射);四个提取函数共享同一个 `Compilation` 与 `SourceManager`
-(只编译一次)。
+信号 full_path 映射);`extract_design` 内部调用**共享编译的私有实现**
+`_extract_*_impl`(§3),只编译一次;公开 `extract_*` 各自独立编译,
+见 §3 设计依据。
 
 ## 3. 子函数规划
 
@@ -173,6 +186,10 @@ class DepEdge:
 | `extract_signals`(公开) | `sv_files: list[str]` | `list[SignalInfo]` | 成员声明 + 端口 + struct 字段展开 |
 | `extract_blocks`(公开) | `sv_files: list[str]` | `list[BlockInfo]` | 直接过程块/连续赋值 + 实例化语句 |
 | `extract_dep_edges`(公开) | `sv_files: list[str]` | `list[DepEdge]` | 赋值级依赖 + 端口连接依赖 |
+| `_extract_hierarchy_impl`(私有) | `root, sm` | `list[InstanceInfo]` | 层次提取实现(共享编译,公开版内部调用) |
+| `_extract_signals_impl`(私有) | `root, sm` | `list[SignalInfo]` | 信号提取实现(共享编译) |
+| `_extract_blocks_impl`(私有) | `root, sm` | `list[BlockInfo]` | 块提取实现(共享编译) |
+| `_extract_dep_edges_impl`(私有) | `root, sm, blocks, signals` | `list[DepEdge]` | 依赖提取实现(共享编译,依赖块键与信号表) |
 | `_build_compilation`(私有) | `sv_files: list[str]` | `(Compilation, RootSymbol, SourceManager)` | 单次编译全部文件并 elaborate |
 | `_report_diagnostics`(私有) | `Compilation` | `None` | 统计 ERROR/WARNING 计数并 log |
 | `_collect_instances`(私有) | `RootSymbol` | `list[InstanceSymbol]` | visit 收集 InstanceSymbol(DFS 前序) |
@@ -189,9 +206,10 @@ class DepEdge:
 | `_build_port_conn_edges`(私有) | `InstanceSymbol, ...` | `list[DepEdge]` | 端口连接跨模块边(In/Out,§6.2) |
 | `_dedup_edges`(私有) | `list[DepEdge]` | `list[DepEdge]` | 按 (driven, read, 块键, flags) 元组去重 |
 
-**设计依据**:公开的四个 extract_* 各自独立可复用时重编译(简易优先);
-`extract_design` 一次编译共享给四个提取器,避免重复 elaboration。
-单一职责、输入/输出类型明确;主函数只做编排。
+**设计依据**:公开 extract_* 独立调用时各自编译一次(独立复用优先,代价是
+重复 elaboration,大设计勿误用);`extract_design` 只编译一次,内部依次调用
+`_extract_*_impl` 私有实现(`extract_design` **不得**调用公开 extract_*,
+否则重复编译 4 次)。单一职责、输入/输出类型明确;主函数只做编排。
 
 ## 4. 数据模型(ParseResult)
 
@@ -231,7 +249,9 @@ class ParseResult:
    `body.portList`);端口的 `direction` 按 ArgumentDirection 枚举映射为
    'input'/'output'/'inout'/'ref';`bit_width` 一律取 `type.bitWidth`
    属性(无 `getBitstreamWidth()` 之类方法);`definition_file/line` 取
-   符号 `location` 经 SourceManager 映射(字段行例外,见规则 6)
+   符号 `location` 经 SourceManager 映射(字段行例外,见规则 6);
+   同 `full_path` 的 port 行与 variable 行合并为一行(规则见 §1.2),
+   信号表按 `full_path` 唯一
 6. struct 字段展开:`canonicalType`(带 `isStruct` 判定)经 `visit()` 收集
    `SymbolKind.Field` 直接字段;字段类型本身为 struct 时递归展开
    (嵌套 struct,如 csr_pkg 的 `csr_cfg_t.baud.div`);字段行
@@ -240,11 +260,13 @@ class ParseResult:
 7. 块:每实例 `body.visit()` 收集直接块,过滤条件
    `parentScope.containingInstance is 本实例 body`(visit 会穿透子实例,
    必须过滤);`index` 为全列表递增序号;源文本行范围见 §1.3
-8. `port_connection` 块:每处模块实例化语句一条,行范围取
-   `inst.syntax.parent.sourceRange`(`inst.syntax.parent` 可能为 None —
-   如无源语法的实例,跳过);块排在实例块列表末尾,index 连续
+8. `port_connection` 块:按父实例枚举(遍历父实例的直接子 `InstanceSymbol`
+   时产出,归属父实例,§1.3),行范围取 `inst.syntax.parent.sourceRange`
+   (`inst.syntax.parent` 可能为 None — 如无源语法的实例,跳过);
+   块排在所属(父)实例块列表末尾,index 连续
 9. 依赖边按 §6 规则提取;`dep_edges` 两端必须引用已产出的信号 `full_path`
-   (信号不在信号表中的边丢弃并 `logger.debug` 记录)
+   (信号不在信号表中的边丢弃并 `logger.debug` 记录);LHS 无法解析为
+   信号行(§6.3 全部规则不命中)时不产 driven 边,同样 `logger.debug` 记录
 10. 确定性:所有遍历按 pyslang 自然顺序;边按 (driven_signal, read_signal,
     block_instance_path, block_index, is_condition, is_port_conn) 元组去重
 
@@ -262,11 +284,19 @@ class ParseResult:
 (复杂度 O(块内节点数),**禁止**对每个信号逐一遍历整个设计)。读取信号经
 §6.3 的匹配/拼接规则解析为 full_path;解析失败(无信号行)的边丢弃。
 
-- **通道 1(RHS 读)**:对块内每个 `ExpressionKind.Assignment` 节点,收集
-  `node.right` 中读取的全部信号(`visit()` 中出现的 `NamedValue` 与
-  `MemberAccess` 链,含三元运算符 `a ? b : c` 的三个操作数——visit 自然穿透),
-  为每个读取信号产生一条边:`driven = node.left 解析为 full_path`(LHS 规则
-  见 §6.3),`read = 读取信号 full_path`,`is_condition=False`。
+- **通道 1(RHS 读 + 隐式读)**:对块内每个 `ExpressionKind.Assignment` 节点,
+  收集读取信号:`node.right` 全子树 + LHS 的 `ElementSelect` 下标表达式
+  (`visit()` 中出现的 `NamedValue` 与 `MemberAccess` 链,含三元运算符
+  `a ? b : c` 的三个操作数——visit 自然穿透),为每个读取信号产生一条边:
+  `driven = node.left 解析为 full_path`(LHS 规则见 §6.3),
+  `read = 读取信号 full_path`,`is_condition=False`。
+  - **复合赋值**(`isCompound=True`,如 `a += b`):实测 AST 不 desugar,
+    `node.right` 只含显式 RHS——**额外**把 LHS 基变量链计入读取
+    (隐式读自身,产生自依赖边 `a → a`)
+  - **自增/自减**(`i++`/`++i`/`i--`/`--i`):实测是 `UnaryOp`
+    (Preincrement/Postincrement/Predecrement/Postdecrement),
+    **不是 Assignment**——单独规则:操作数计入隐式读并作为 driven,
+    产生自依赖边(driven=read=操作数信号,`is_condition=False`)
 - **通道 2(门控条件读)**:对块内每个条件类语句节点,把条件表达式广播给
   分支子树内**全部**赋值:
   - `StatementKind.Conditional`:`cond = [c.expr for c in node.conditions]`,
@@ -285,7 +315,8 @@ class ParseResult:
   wrapper,id 不稳定);Symbol 的 `id()` 在单次 elaboration 内稳定,可用于
   符号级去重(见 pyslang skill「已验证的编码最佳实践」)
 - 连续赋值(`ContinuousAssign`)只走通道 1(无语句条件),行为同过程块;
-  循环头 `i=0`/`i++` 是普通 Assignment(通道 1),`i<n` 是 stopExpr(通道 2)
+  循环头 `i=0` 是普通 Assignment(通道 1),`i<n` 是 stopExpr(通道 2),
+  `i++` 走 UnaryOp 自依赖规则(见上)
 
 ### 6.2 跨模块端口连接依赖
 
@@ -299,6 +330,9 @@ class ParseResult:
 
 - 每条连接一条边,`is_port_conn=True`,`is_condition=False`,
   `(block_instance_path, block_index)` 指向该实例化语句的 `port_connection` 块
+- 归属:`port_connection` 块的 `instance_path` 与边的 `block_instance_path`
+  均记**父实例**路径(实例化语句位于父模块);子/父两侧信号 full_path
+  各自按所属实例解析(§1.3)
 - 连接表达式为 `NamedValue` 时取 `expr.symbol`(其 `hierarchicalPath` 实测为
   父实例内完整路径,可直接用);连接表达式为 `MemberAccess`(struct 端口字段)
   时按 §6.3 的 full_path 拼接规则解析
@@ -321,6 +355,13 @@ class ParseResult:
   字段级关系属流程④职责);`MemberAccess` LHS → 驱动**完整链末端**字段行
   (如 `cfg_reg.baud.div <= x` 只驱动 `...cfg_reg.baud.div` 行,
   不驱动链上中间字段)
+- LHS 为 `ElementSelect`(数组元素写,如 `s[i] <= d`):沿 `.value` 链剥离
+  Select 得到基表达式,再按上述 NamedValue/MemberAccess 规则取驱动行
+  (数组元素不单独成行,driven = 数组基信号行);LHS 的 `.selector` 下标
+  表达式计入通道 1 读取(下标是读);混合链(`cfg_reg.baud.div[i] <= x`)
+  剥 Select 后按 MemberAccess 链规则继续解析
+- 读侧 `x = mem[addr]`:`visit()` 自然穿透 `ElementSelect` 命中
+  `mem`/`addr` 的 NamedValue,无需特殊代码
 
 ### 6.4 语义
 
@@ -329,6 +370,9 @@ class ParseResult:
 - 同一张边表两个方向查询,流程③落库一次、流程④双向复用
   (与 doc/structure.md §3 一致)
 - 自依赖允许(`b = b + 1`:driven 与 read 同信号)
+- **base↔field 合并提示(为流程④预留)**:整 struct 赋值驱动基行、字段写
+  驱动叶子行,本流程只存事实边;流程④的 driver/load 查询需在 SQL 侧制定
+  base↔field 层级合并规则(规划 flow4 spec 时明确)
 
 ## 7. 错误处理
 
@@ -355,9 +399,10 @@ class ParseResult:
 - struct 嵌套任意深度 → 字段递归展开为一行一字段
 - 整 struct 赋值 / 整 struct 读 → 以基变量行参与依赖(字段级关系属流程④)
 - 顶层模块端口(无 portConnections)→ 无端口连接边
-- 循环头 `i=0`/`i++`(普通赋值)、`i<n`(stopExpr)→ 按 §6.1 两通道自然处理
+- 循环头 `i=0`(普通赋值)、`i++`(UnaryOp 自依赖)、`i<n`(stopExpr)
+  → 按 §6.1 各规则处理
 - 数组实例 / 接口实例 / generate 生成的实例 → 均可收进实例树;其依赖提取
-  规则未专门覆盖(见 §9 非目标)
+  规则未专门覆盖(见 §10 非目标)
 
 ## 9. 与流程③的接口契约
 
@@ -365,7 +410,9 @@ class ParseResult:
 - 四列表的确定顺序即流程③建库的插入顺序(§4);`blocks.index` 对应
   blocks 表的行 id(流程③保证 index 即自增 id,或自行维护映射)
 - 依赖边引用信号 `full_path` 与块 `(instance_path, index)`,流程③据此解析
-  外键,不解析失败即告警
+  外键,解析失败即告警;端口连接边同样引用 `port_connection` 块的
+  `block_id`(非 NULL,`is_port_conn` 列区分边类型),ref.md §7.1 注释已按
+  此同步
 - 流程③表结构见 doc/ref.md §7.1(dep_edges 的 `is_condition` /
   `is_port_conn` 列由本流程的 `DepEdge` 标志填充)
 
