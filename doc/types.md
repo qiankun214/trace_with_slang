@@ -23,6 +23,13 @@
 未新增自定义类型:直接消费流程②的 `ParseResult`(定义于 `src/datatypes.py`),
 建库后以 sqlite 表行承载(表结构定稿见 `doc/flow3_design_spec.md` §4)。
 
+## 流程④(API 查询)
+
+未新增自定义类型:复用流程②的 `SignalInfo`(`get_variable_info` 返回值)与
+`BlockInfo`(`get_assignment_blocks` 返回元素,`index = blocks.id - 1`);
+`trace_load` / `trace_driver` 返回 `list[str]`(信号 full_path)。
+查询语义(端口连接边方向映射、base↔field 层级合并)见 `doc/flow4_design_spec.md` §5。
+
 ## 流程①(filelist 解析)
 
 定义于 `src/filelist.py`,为流程内部私有类型,不跨流程传递:

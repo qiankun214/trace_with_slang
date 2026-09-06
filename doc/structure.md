@@ -46,7 +46,7 @@
   | trace load | load 信号列表（fan-out：读取该变量的赋值块所驱动的信号） |
   | trace driver | driver 信号列表（fan-in：驱动该变量的赋值块内被读的信号） |
 - **功能**：只读查询 sqlite，服务上述四大需求
-- **一级函数**：变量信息查询 / 赋值块查询 / trace_load / trace_driver，均以 `db 路径 + var_path` 为输入
+- **一级函数**：`get_variable_info` / `get_assignment_blocks` / `trace_load` / `trace_driver`，均以 `db 路径 + var_path` 为输入（实现于 `src/query.py`，复用 `src/schema.py` 表元数据；行为契约见 `doc/flow4_design_spec.md`）
 
 ## 3. 数据流
 
