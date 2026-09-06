@@ -10,7 +10,7 @@
 |---|---|---|
 | 一级 fan-out 追踪（现有实现） | ✅ 已实现 | `src/trace_var_driver.py` |
 | fan-in 追踪（driver 侧） | ✅ 已实现 | `src/trace_var.py` |
-| 赋值级算法修复（消除误报） | 📋 已设计，未实现 | 本文档 §5 |
+| 赋值级算法修复（消除误报） | ✅ 已实现 | `src/extract.py`（两通道单遍建边，行为契约 doc/flow2_design_spec.md §6） |
 | SQLite 落库（便于查询） | 📋 已设计，未实现 | 本文档 §7 |
 
 ## 1. 概念与术语

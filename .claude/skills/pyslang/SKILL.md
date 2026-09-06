@@ -1,7 +1,7 @@
 ---
 name: pyslang
 description: This skill should be used when writing Python scripts that parse, analyze, or extract information from SystemVerilog files using the pyslang library. Covers CST (syntax tree), AST (elaborated symbol tree), type resolution, port/variable extraction, and source location mapping. Triggers on phrases like "pyslang", "用pyslang", "扫描SV", "提取端口", "SystemVerilog解析", "slang python", or when working with .sv file analysis tools.
-version: 1.4.3
+version: 1.4.4
 ---
 
 # pyslang API Reference & Coding Guide
@@ -164,6 +164,8 @@ elif port_header.kind == SK.VariablePortHeader:
 ```python
 # DataDeclaration / NetDeclaration / ParameterDeclaration:
 #   有 declarators 列表，每个 decl 有 decl.name.value (变量名)
+# 注意: 多变量声明 (logic [7:0] x, y;) 的 declarators 混有逗号 Token
+#   (TokenKind.Comma)，遍历时必须按 hasattr(decl, 'name') 过滤!
 
 # ParameterDeclarationStatement:
 #   是包装节点，实际声明在 member.parameter (ParameterDeclarationSyntax)
@@ -314,15 +316,30 @@ EK.NamedValue        # 变量/信号引用
                      # 属性: .symbol → VariableSymbol/NetSymbol（已解析类型/位宽/路径）
 EK.UnaryOp           # 一元运算
                      # 实测: 自增/自减(i++/++i/i--/--i)是 UnaryOp 而非 Assignment
-                     # (UnaryOperator.Preincrement/Postincrement/Predecrement/Postdecrement),
-                     # 语义为隐式读+写操作数
+                     # (UnaryOperator.Preincrement/Postincrement/Predecrement/Postdecrement,
+                     #  经 node.op 枚举比较),语义为隐式读+写操作数
+                     # 属性: .operand
 EK.BinaryOp          # 二元运算
 EK.ElementSelect     # 数组元素选择（读写两侧均出现）: .value (基表达式), .selector (下标)
                      # LHS 数组写 s[i] <= d: 沿 .value 链剥离得到基信号行（元素不单独成行）;
                      # 下标是读: LHS 的 .selector 中的 NamedValue 计入读取
                      # 读侧 x = mem[addr]: visit() 自然穿透命中 mem/addr，无需特殊代码
 EK.ConditionalOp     # 三元运算符 (a ? b : c)
-                     # 属性: visit() 会穿透到三个操作数（选择符 + 两个分支）
+                     # 属性: visit() 会穿透到三个操作数（选择符 + 两个分支）;
+                     # 条件经 .conditions 列表访问(实测无 pred/condition 属性):
+                     #   node.conditions[0].expr → 选择符表达式(结构同
+                     #   ConditionalStatement 的 Condition:.expr/.pattern)
+EK.RangeSelect       # 部分选择 (q[3:0], a[sel +: 4])
+                     # 属性: .value(基表达式)、.left(上界/偏移)、.right(下界/宽度)
+                     # 注意: 与 ElementSelect(.value/.selector) 属性不同!
+EK.Concatenation     # 拼接 {a, b}
+                     # 属性: .operands (list[Expression])
+EK.Replication       # 复制 {2{a}}
+                     # 属性: .count(次数)、.concat(内部 Concatenation)
+EK.Conversion        # 隐式/显式类型转换(实测 RHS 常被 Conversion 包裹)
+                     # 属性: .operand
+EK.Call              # 函数/系统调用
+                     # 属性: .arguments (list[Expression])
 EK.IntegerLiteral    # 整数常量
 EK.Conversion        # 类型转换
 EK.EmptyArgument     # 空参数（端口连接中输出端口 RHS 常见）
@@ -1134,6 +1151,56 @@ def find_input_port_connection(body, var_name):
 - `inst.definition.body` → 不存在！`DefinitionSymbol` 没有 `body` 属性，用 `inst.body` 获取 `InstanceBodySymbol`
 - `inst.location` 获取文件路径 → 用 `inst.definition.location`！前者指向父模块的实例化位置，后者才指向模块定义文件
 
+### 4.9 显式递归表达式遍历（读取收集的推荐做法）
+
+收集表达式中读取的信号时，**推荐显式递归遍历**而非 flat visit——只有显式递归
+能实现"最大链"语义（`a.b.c` 整体为一次读取，不重复计 `a`/`a.b` 前缀；
+flat visit 无退出回调，无法区分嵌套链与兄弟链，前缀去重是近似：
+同一表达式"整链 + 部分链"并存如 `a.b.c + a.b` 会漏报部分链）。
+
+子表达式属性分发表（flow2 `_expression_children` 实测）：
+
+| ExpressionKind | 子表达式 |
+|---|---|
+| NamedValue | 无（叶子，读 symbol.name） |
+| MemberAccess | `.value`（`.member` 是字段名非表达式；链整体处理，不递归链上前缀） |
+| UnaryOp | `.operand` |
+| BinaryOp | `.left` / `.right` |
+| ConditionalOp | `[c.expr for c in .conditions] + .left + .right` |
+| Assignment | `.left` / `.right` |
+| ElementSelect | `.value` / `.selector` |
+| RangeSelect | `.value` / `.left` / `.right` |
+| Conversion | `.operand` |
+| Concatenation | `.operands`（list） |
+| Replication | `.count` / `.concat` |
+| Call | `.arguments`（list） |
+| IntegerLiteral 等叶子 | 无 |
+
+未知种类回退 `node.visit()` 收集 NV/MA（仅罕见种类如结构化赋值模式，近似可接受）。
+
+### 4.10 struct 类型判定与字段枚举
+
+```python
+# typedef struct 的 TypeAlias 与 canonicalType 都带 isStruct=True
+t = sym.type                      # TypeAlias (如 csr_pkg::csr_cfg_t), isStruct=True
+scope = t.canonicalType           # PackedStructType, visit() 收集【直接】Field 符号
+fields = []
+scope.visit(lambda s: fields.append(s) if s.kind == ast.SymbolKind.Field else None)
+# 嵌套 struct: 字段自身 type 也带 isStruct → 用 field.type.canonicalType 递归展开
+# FieldSymbol.hierarchicalPath 指向类型定义处(如 csr_pkg.baud)，
+# 实例内字段路径必须自行拼接: instance_path + '.' + 基名 + '.' + 各字段名
+```
+
+### 4.11 其他实测注意
+
+- **多变量声明**：`logic [7:0] x, y;` 的 `member.declarators` 混有逗号 Token，须 `hasattr(d, 'name')` 过滤（§2.7）
+- **GenvarSymbol 无 `.type` 属性**——访问前先按 kind 排除
+- **for 循环局部变量**：`for (int j...)` 的 NamedValue symbol 为 `SymbolKind.Variable`、`hierarchicalPath` 形如 `t.j`，但 `body.find('j')` 为 None（非成员声明，信号表无此行）
+- **未连接端口**：`conn.expression` 为 None（Out 未连接）或 `EmptyArgument`（`.p ()`）；编译伴随 `EmptyOutputPortConn` 诊断
+- **输入端口连接可为常量**（`.a_valid(1'b1)`）→ 表达式结构不识别，跳过该连接
+- **SourceManager.getSourceText(buffer)**：取整个 buffer 的原始文本（配合 `getFullPath(buffer)` 取绝对路径 pathlib.Path，可替代文件 IO 取源文本）
+- **子实例过滤**：`InstanceSymbol.visit()` 包含自身；过滤直接子实例须**先按 kind 过滤再取 parentScope**（visit 会遍历 NamedValue 等表达式节点，它们没有 parentScope 属性）
+
 ---
 
 ## 5. 版本兼容性
@@ -1200,6 +1267,7 @@ def find_input_port_connection(body, var_name):
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 1.4.4 | 2026-09-05 | 新增:ConditionalOp.conditions(.expr,无 pred 属性)、RangeSelect(.value/.left/.right,与 ElementSelect 不同)、Concatenation/Replication/Conversion/Call 子表达式属性、UnaryOperator 自增自减枚举;§4.9 显式递归表达式遍历分发表(最大链语义,flat visit 近似缺陷)、§4.10 struct 类型判定与字段枚举(isStruct/canonicalType.visit 直接字段)、§4.11 实测注意(declarators 混 Token、Genvar 无 .type、for 局部变量 find 不到、未连接端口、getSourceText) |
 | 1.4.3 | 2026-08-23 | 补充 ExpressionKind 实测:复合赋值(isCompound)不 desugar、隐式读 LHS 需自行补;自增/自减为 UnaryOp 非 Assignment;新增 ElementSelect(.value/.selector,数组 LHS 解基行、下标是读) |
 | 1.4.2 | 2026-08-16 | 新增：2.8 StatementKind 语句节点（Conditional/Case/ForLoop/Timed 结构属性、语句节点无 Loop 枚举、pybind11 表达式节点 id 不稳定）；3.3 ExpressionKind 补充 ConditionalOp（三元运算符，visit 穿透三操作数）| 
 | 1.4.1 | 2026-07-30 | 完善：3.5 ArgumentDirection — 明确枚举值列表和直接比较模式（区分 DIRECTION_MAP 仅用于显示）；5 新增「已验证的编码最佳实践」— hasattr 防御性属性访问、id(symbol) 去重（name 不能去重的原因）|

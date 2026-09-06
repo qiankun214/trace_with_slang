@@ -1,7 +1,7 @@
 ---
 name: trace_with_slang
 description: This skill should be used when developing or refactoring the trace_with_slang project itself — the SystemVerilog trace analysis tool (pyslang parse → sqlite → API). Covers the project's architecture design (4-flow pipeline with strict input/output chaining), the four core features (variable info, assignment blocks, trace load, trace driver), doc structure, and coding conventions. Triggers on phrases like "trace_with_slang", "本项目", "本库", "架构设计", "重构", "开发本项目" or when planning work in src/.
-version: 1.0.3
+version: 1.0.5
 ---
 
 # trace_with_slang — 项目知识与架构设计
@@ -34,16 +34,18 @@ version: 1.0.3
 - **功能**：读取 filelist，跳过注释行与空行，相对路径基于 filelist 所在目录解析；缺失的 `.sv` 文件告警并跳过，filelist 本身缺失时报错退出
 - **一级函数**：`parse_filelist(filelist_path: str) -> list[str]`
 
-### 流程 ② pyslang 解析与信息提取
+### 流程 ② pyslang 解析与信息提取（✅ 已实现：`src/extract.py`）
 
-- **输入**：流程①的输出（`.sv` 文件绝对路径列表）
-- **输出**：解析信息集合
-  - 实例层次树：模块名、实例层次路径、端口（方向/位宽）
-  - 变量信息：变量层次路径、类型、位宽、符号种类、定义位置（文件/行号）
-  - 完整赋值语句块：always 块（always_comb/always_ff 等）或 assign 语句，含块类型、源文本、所在文件与起止行号
-  - 依赖信息：块内读写变量关系、跨模块端口连接关系
-- **功能**：pyslang 编译（Compilation + 语法/诊断检查），基于 elaborated AST 分析提取上述信息
-- **一级函数**：`extract_hierarchy(sv_files) -> hierarchy`，以及变量信息、赋值语句块、依赖信息的提取函数
+- **输入**：流程①的输出（`.sv` 文件绝对路径列表；空列表合法）
+- **输出**：`ParseResult`（纯数据 dataclass，不含任何 pyslang 对象；定义于 `src/datatypes.py`）
+  - `instances` 实例层次树（InstanceInfo：模块名、实例层次路径、端口方向/位宽）
+  - `signals` 信号（SignalInfo：层次路径、类型、位宽、符号种类、定义位置；struct 字段逐字段展开为一行；按 full_path 唯一，port 与同名内部变量合并为一行）
+  - `blocks` 完整赋值语句块（BlockInfo：always/assign + port_connection 块，含块类型、源文本、所在文件与起止行号）
+  - `dep_edges` 依赖边（DepEdge：driven/read 信号 full_path + **显式绑定**的 BlockInfo 对象 + is_condition/is_port_conn 标志）
+- **功能**：pyslang 一次性编译全部文件（Compilation + elaborate + 诊断检查），基于 elaborated AST 赋值级提取两通道依赖（§6.1）+ 跨模块端口连接依赖（§6.2）
+- **一级函数**：`extract_design(sv_files: list[str]) -> ParseResult`（一次编译提取四组信息，流程③的输入）
+- **分组函数**：`extract_hierarchy` / `extract_signals` / `extract_blocks` / `extract_dep_edges`（各自独立编译一次，独立复用优先，大设计勿混用）
+- 行为契约见 `doc/flow2_design_spec.md`（实现细节以 spec 为准）
 
 ### 流程 ③ sqlite 落库
 

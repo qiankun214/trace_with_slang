@@ -26,7 +26,7 @@
   - 完整赋值语句块：always 块（always_comb/always_ff 等）或 assign 语句，含块类型、源文本、所在文件与起止行号
   - 依赖信息：赋值块内读写变量关系、跨模块端口连接关系
 - **功能**：调用 pyslang 编译（Compilation + 语法/诊断检查），基于 elaborated AST 分析并提取上述信息
-- **一级函数**：`extract_hierarchy(sv_files) -> hierarchy`，以及变量信息、赋值语句块、依赖信息的提取函数
+- **一级函数**：`extract_design(sv_files: list[str]) -> ParseResult`（一次编译提取四组信息，实现于 `src/extract.py`，数据模型定义于 `src/datatypes.py`）；另有分组函数 `extract_hierarchy` / `extract_signals` / `extract_blocks` / `extract_dep_edges`（各自独立编译，独立复用优先）
 
 ### 流程 ③ sqlite 落库
 

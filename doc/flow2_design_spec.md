@@ -527,7 +527,7 @@ BlockInfo 对象,并对照信号 full_path 映射);`extract_design` 内部调用
 ## 10. 非目标(明确不做)
 
 - 不做 sqlite 落库(流程③职责);不做查询 API(流程④职责)
-- 不实现多级递归 fan-out/fan-in(由流程④以 SQL 递归完成)
+- 不实现多级递归
 - 不展开宏 / `include` / 不处理预处理器指令
 - 不专门支持接口(modport/clocking block 语义)、数组实例元素的信号级追踪
 - 不提取过程块内局部变量(仅模块级成员声明)
