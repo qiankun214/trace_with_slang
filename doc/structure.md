@@ -32,8 +32,8 @@
 
 - **输入**：流程②的输出（解析信息集合）
 - **输出**：sqlite 数据库路径（数据库文件）
-- **功能**：将实例、信号、赋值语句块、依赖边一次性持久化入库（表设计详见 `doc/ref.md` §7），此后所有查询只读该库，无需重新解析
-- **一级函数**：`build_db(解析信息, db_path) -> None`
+- **功能**：将实例、信号、赋值语句块、依赖边一次性持久化入库（表设计定稿见 `doc/flow3_design_spec.md` §4，初稿 `doc/ref.md` §7.1），此后所有查询只读该库，无需重新解析
+- **一级函数**：`build_db(parse_result: ParseResult, db_path: str) -> None`（基于 SQLAlchemy Core，表元数据定义于 `src/schema.py`；行为契约见 `doc/flow3_design_spec.md`）
 
 ### 流程 ④ API 查询
 

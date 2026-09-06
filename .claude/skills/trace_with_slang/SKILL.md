@@ -1,7 +1,7 @@
 ---
 name: trace_with_slang
 description: This skill should be used when developing or refactoring the trace_with_slang project itself — the SystemVerilog trace analysis tool (pyslang parse → sqlite → API). Covers the project's architecture design (4-flow pipeline with strict input/output chaining), the four core features (variable info, assignment blocks, trace load, trace driver), doc structure, and coding conventions. Triggers on phrases like "trace_with_slang", "本项目", "本库", "架构设计", "重构", "开发本项目" or when planning work in src/.
-version: 1.0.5
+version: 1.0.7
 ---
 
 # trace_with_slang — 项目知识与架构设计
@@ -51,8 +51,8 @@ version: 1.0.5
 
 - **输入**：流程②的输出（解析信息集合）
 - **输出**：sqlite 数据库**路径**（数据库文件）
-- **功能**：将实例、信号、赋值语句块、依赖边一次性持久化入库（表设计详见 doc/ref.md §7），此后所有查询只读该库，无需重新解析
-- **一级函数**：`build_db(解析信息, db_path) -> None`
+- **功能**：将实例、信号、赋值语句块、依赖边一次性持久化入库（表设计定稿见 doc/flow3_design_spec.md §4，初稿 doc/ref.md §7.1；基于 SQLAlchemy Core 实现，不手写 sqlite3/DDL），此后所有查询只读该库，无需重新解析
+- **一级函数**：`build_db(parse_result: ParseResult, db_path: str) -> None`（全量重建；表元数据定义于 `src/schema.py`，流程④复用；行为契约见 `doc/flow3_design_spec.md`）
 
 ### 流程 ④ API 查询
 
@@ -75,6 +75,7 @@ version: 1.0.5
 - doc/types.md — 记录所有自定义类型，标注功能
 - doc/flow1_design_spec.md — 流程①（filelist 解析）行为规格：输入/输出、处理流程、子函数规划、错误处理与边界情况
 - doc/flow2_design_spec.md — 流程②（pyslang 解析与信息提取）行为规格：ParseResult 数据模型（InstanceInfo/SignalInfo/BlockInfo/DepEdge）、四组提取函数、赋值级依赖两通道算法、端口连接依赖、错误处理与边界情况
+- doc/flow3_design_spec.md — 流程③（sqlite 落库）行为规格：表结构定稿（6 表：instances/instance_ports/signals/blocks/dep_edges）、SQLAlchemy Core 实现（src/schema.py 共享元数据、engine.begin 单事务、connect 事件 PRAGMA、全表显式 id）、id 映射（id=index+1、对象身份→block_id）、流程④ SQL 模式与错误处理
 
 ## 5. 开发规范（claude.md 要点）
 

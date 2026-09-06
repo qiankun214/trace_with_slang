@@ -18,6 +18,11 @@
 | `BlockInfo` | 完整赋值语句块(always/assign/port_connection,blocks 表行) | `instance_path` / `index`(全局块序号,作为 block 键) / `block_type` / `source_file` / `start_line` / `end_line` / `source_text` |
 | `DepEdge` | 依赖边(dep_edges 表行;driver/load 的共同数据源) | `driven_signal` / `read_signal`(full_path) / `block`(**显式绑定** BlockInfo 对象,可为 None) / `is_condition` / `is_port_conn` |
 
+## 流程③(sqlite 落库)
+
+未新增自定义类型:直接消费流程②的 `ParseResult`(定义于 `src/datatypes.py`),
+建库后以 sqlite 表行承载(表结构定稿见 `doc/flow3_design_spec.md` §4)。
+
 ## 流程①(filelist 解析)
 
 定义于 `src/filelist.py`,为流程内部私有类型,不跨流程传递:
