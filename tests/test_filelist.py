@@ -110,6 +110,12 @@ class TestBasic:
         assert exc_info.value.code == 1
         assert any("不存在" in m and str(bad) in m for m in _error_messages(log_records))
 
+    def test_目录当filelist告警跳过(self, tmp_path, log_records):
+        """已存在目录作为 filelist 路径:存在性校验通过,内部按非文件
+        告警跳过返回空列表,不抛 IOError(规格未定义,仅验健壮性)。"""
+        assert parse_filelist(str(tmp_path)) == []
+        _assert_warning(log_records, "不存在", "跳过")
+
     def test_缺失sv文件告警并跳过其余(self, make_file, make_filelist, log_records):
         """单个 .sv 缺失应告警并跳过,其余行继续解析(DS §5)。"""
         make_file("a.sv")
@@ -295,6 +301,13 @@ class TestFlagV:
         top = make_filelist("top.f", "a.sv", "-v a.sv")
         assert parse_filelist(str(top)) == [os.path.abspath(str(top.parent / "a.sv"))]
 
+    def test_行尾孤立v不崩溃(self, make_file, make_filelist, log_records):
+        """行尾孤立 -v(无参数)不应抛异常,其余行照常解析(规格未定义,仅验健壮性)。"""
+        make_file("a.sv")
+        top = make_filelist("top.f", "a.sv", "-v")
+        assert parse_filelist(str(top)) == [os.path.abspath(str(top.parent / "a.sv"))]
+        assert any("-v" in m for m in _warn_messages(log_records))
+
 
 class TestFlagY:
     """-y 库目录扫描(DS §4.9/§6)"""
@@ -341,6 +354,13 @@ class TestFlagY:
         make_file("lib/m.sv")
         top = make_filelist("top.f", "a.sv", "-y lib", "b.sv")
         assert _basenames(parse_filelist(str(top))) == ["a.sv", "m.sv", "b.sv"]
+
+    def test_行尾孤立y不崩溃(self, make_file, make_filelist, log_records):
+        """行尾孤立 -y(无参数)不应抛异常,其余行照常解析(规格未定义,仅验健壮性)。"""
+        make_file("a.sv")
+        top = make_filelist("top.f", "a.sv", "-y")
+        assert parse_filelist(str(top)) == [os.path.abspath(str(top.parent / "a.sv"))]
+        assert any("-y" in m for m in _warn_messages(log_records))
 
 
 class TestEnvVar:

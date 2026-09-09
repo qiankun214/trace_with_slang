@@ -541,3 +541,219 @@ class TestDepEdges:
         design_keys = _full_keys(extract_design(files).dep_edges)
         group_keys = _full_keys(extract_dep_edges(files))
         assert design_keys == group_keys
+
+
+# ── 补充边界场景:非 ANSI 合并 / 不可解析 LHS / 事件成员 / 连接表达式 ────
+
+class TestLegacyPortMerge:
+    """DS §1.5:非 ANSI 端口(方向声明 + 同名成员声明)合并行与 parameter type 跳过。"""
+
+    def test_非ANSI成员声明与端口行合并(self):
+        result = extract_design([_file("flow2_edge/legacy_ports.sv")])
+        smap = _signal_map(result.signals)
+        assert set(smap) == {"legacy_top.a", "legacy_top.y"}
+        merged = smap["legacy_top.y"]
+        # kind/is_port/direction 取端口行,其余取成员符号(reg y)
+        assert (merged.kind, merged.is_port, merged.direction) == ("port", True, "output")
+        assert (merged.name, merged.type_name, merged.bit_width) == ("y", "reg", 1)
+        assert merged.definition_file == _file("flow2_edge/legacy_ports.sv")
+
+    def test_parameter_type成员不展开为信号行(self):
+        """DS §1.5:模块体 parameter type 属非信号符号(TypeParameter),跳过。"""
+        result = extract_design([_file("flow2_edge/legacy_ports.sv")])
+        assert "legacy_top.T" not in _signal_map(result.signals)
+
+    def test_合并后依赖边正常(self):
+        result = extract_design([_file("flow2_edge/legacy_ports.sv")])
+        assert _sig_keys(result.dep_edges) == {
+            ("legacy_top.y", "legacy_top.a", False, False),
+        }
+        _assert_edges_resolve(result)
+
+
+class TestStructArrayElemLhs:
+    """DS §6.3/§5 规则 9:struct 数组元素字段写 LHS 不可解析,丢弃并 debug。"""
+
+    def test_字段写经元素选择整体丢弃(self, log_records):
+        result = extract_design([_file("flow2_edge/struct_array_elem.sv")])
+        pre = "struct_arr_top."
+        assert _sig_keys(result.dep_edges) == {
+            (pre + "q", pre + "clk", True, False),
+            (pre + "q", pre + "d", False, False),
+        }
+        var_path = pre + "arr"
+        assert not any(
+            s == var_path or s.startswith(var_path + ".")
+            for e in result.dep_edges
+            for s in (e.driven_signal, e.read_signal)
+        )
+        debug_msgs = _debug_messages(log_records)
+        assert any("LHS 无法解析为信号行" in m and "struct_arr_top" in m
+                   for m in debug_msgs)
+        _assert_edges_resolve(result)
+
+    def test_数组变量无字段展开行(self):
+        """DS §1.5:非 struct 类型的数组变量不展开字段。"""
+        result = extract_design([_file("flow2_edge/struct_array_elem.sv")])
+        smap = _signal_map(result.signals)
+        assert "struct_arr_top.arr" in smap
+        assert not any(p.startswith("struct_arr_top.arr.") for p in smap)
+
+
+class TestConcatLhsDrop:
+    """DS §6.3/§5 规则 9:拼接 LHS 不可解析,丢弃并 debug,其余赋值照常。"""
+
+    def test_拼接LHS整体丢弃(self, log_records):
+        result = extract_design([_file("flow2_edge/concat_lhs.sv")])
+        pre = "concat_lhs_top."
+        assert _sig_keys(result.dep_edges) == {(pre + "q", pre + "d", False, False)}
+        debug_msgs = _debug_messages(log_records)
+        assert any("LHS 无法解析为信号行" in m and "concat_lhs_top" in m
+                   for m in debug_msgs)
+        _assert_edges_resolve(result)
+
+
+class TestEventListMemberCond:
+    """DS §6.1/§5.2:事件列表中 struct 成员字段读作为门控条件。"""
+
+    def test_事件成员条件边与字段行(self):
+        result = extract_design([_file("flow2_edge/event_struct_member.sv")])
+        smap = _signal_map(result.signals)
+        field = smap["event_member_top.ctl.flag"]
+        assert (field.kind, field.type_name, field.bit_width) == ("field", "logic", 1)
+        pre = "event_member_top."
+        assert _sig_keys(result.dep_edges) == {
+            (pre + "q", pre + "clk", True, False),
+            (pre + "q", pre + "ctl.flag", True, False),
+            (pre + "q", pre + "d", False, False),
+        }
+        _assert_edges_resolve(result)
+
+
+class TestFunctionCallRead:
+    """DS §6.3:RHS 函数调用实参按读取收集。"""
+
+    def test_函数实参产生读边(self):
+        result = extract_design([_file("flow2_edge/func_call_rhs.sv")])
+        pre = "func_call_top."
+        assert _sig_keys(result.dep_edges) == {
+            (pre + "y", pre + "a", False, False),
+            (pre + "y", pre + "b", False, False),
+        }
+        _assert_edges_resolve(result)
+
+
+class TestPartSelectLhsWrite:
+    """DS §6.3:LHS 部分选择写剥离后驱动基变量,边界表达式作读取。"""
+
+    def test_部分选择写驱动基变量(self):
+        result = extract_design([_file("flow2_edge/part_sel_lhs.sv")])
+        pre = "part_sel_lhs_top."
+        assert _sig_keys(result.dep_edges) == {
+            (pre + "q", pre + "clk", True, False),
+            (pre + "q", pre + "d", False, False),
+        }
+        _assert_edges_resolve(result)
+
+
+class TestConstConditionGating:
+    """DS §6.1 通道 2:条件无有效信号读时不产生条件边。"""
+
+    def test_常量条件无广播(self):
+        result = extract_design([_file("flow2_edge/const_cond.sv")])
+        assert _sig_keys(result.dep_edges) == {
+            ("const_cond_top.q", "const_cond_top.d", False, False),
+        }
+        assert not any(e.is_condition for e in result.dep_edges)
+        _assert_edges_resolve(result)
+
+
+class TestBlockLocalVarGated:
+    """DS §5 规则 9:门控分支内块局部变量的驱动不在信号表,只留外层条件边。"""
+
+    def test_块局部变量赋值被丢弃(self, log_records):
+        result = extract_design([_file("flow2_edge/block_local_var.sv")])
+        pre = "block_local_top."
+        assert _sig_keys(result.dep_edges) == {(pre + "y", pre + "en", True, False)}
+        debug_msgs = _debug_messages(log_records)
+        assert any(pre + "tmp" in m for m in debug_msgs)
+        _assert_edges_resolve(result)
+
+
+class TestIncDecOnSelect:
+    """DS §6.1/§6.3:自增/自减作用于下标选择时,下标读额外产边。"""
+
+    def test_自增自依赖与下标读边(self):
+        result = extract_design([_file("flow2_edge/incdec_on_select.sv")])
+        pre = "incdec_sel_top."
+        assert _sig_keys(result.dep_edges) == {
+            (pre + "cntr", pre + "cntr", False, False),
+            (pre + "cntr", pre + "i", False, False),
+        }
+        _assert_edges_resolve(result)
+
+
+class TestPortConnStructMemberExpr:
+    """DS §6.2:父侧连接表达式为 struct 字段时按拼接规则解析。"""
+
+    def test_struct字段连接边双向(self):
+        result = extract_design([_file("flow2_edge/portconn_struct_member.sv")])
+        smap = _signal_map(result.signals)
+        assert "portconn_member_top.cfg.lo" in smap
+        pre = "portconn_member_top."
+        keys = _sig_keys(result.dep_edges)
+        assert (pre + "cfg.lo", pre + "u_leaf.lo_i", False, True) in keys
+        assert (pre + "u_leaf.lo_o", pre + "cfg.lo", False, True) in keys
+        assert (pre + "y", pre + "d", False, False) in keys
+        conn_edges = [e for e in result.dep_edges if e.is_port_conn]
+        assert all(e.block is not None and e.block.block_type == "port_connection"
+                   for e in conn_edges)
+        _assert_edges_resolve(result)
+
+
+class TestPortConnDroppedEndpoints:
+    """DS §6.2/§5 规则 9:连接边端点不在信号表(父侧部分选择/隐式网)时丢弃。"""
+
+    def test_部分选择输出连接被丢弃(self, log_records):
+        result = extract_design([_file("flow2_edge/portconn_edge_drop.sv")])
+        pre = "portconn_drop_ps_top."
+        keys = _sig_keys(result.dep_edges)
+        assert (pre + "d", pre + "u_ps.i_i", False, True) in keys
+        assert (pre + "y", pre + "d", False, False) in keys
+        assert not any("u_ps.o_o" in s for e in result.dep_edges for s in
+                       (e.driven_signal, e.read_signal))
+        debug_msgs = _debug_messages(log_records)
+        assert any("丢弃" in m and "u_ps.o_o" in m for m in debug_msgs)
+
+    def test_未声明隐式网输入连接被丢弃(self, log_records):
+        result = extract_design([_file("flow2_edge/portconn_edge_drop.sv")])
+        pre = "portconn_drop_in_top."
+        keys = _sig_keys(result.dep_edges)
+        assert (pre + "u_in.a_o", pre + "y", False, True) in keys
+        assert (pre + "y", pre + "d", False, False) in keys
+        assert not any("undeclared_wire" in s for e in result.dep_edges for s in
+                       (e.driven_signal, e.read_signal))
+        debug_msgs = _debug_messages(log_records)
+        assert any("丢弃" in m and "u_in.a_i" in m for m in debug_msgs)
+
+    def test_丢弃后其余边端点全部有效(self):
+        result = extract_design([_file("flow2_edge/portconn_edge_drop.sv")])
+        _assert_edges_resolve(result)
+
+
+class TestPortConnUnrecognizedExpr:
+    """DS §7/§5 规则 3:输出连接表达式结构不识别(不可赋值常量,编译 ERROR
+    经错误恢复)时告警跳过,提取继续完成。"""
+
+    def test_常量输出连接告警跳过(self, log_records):
+        result = extract_design([_file("flow2_edge/portconn_literal_out.sv")])
+        warn_msgs = _warn_messages(log_records)
+        assert any("输出端口连接表达式结构不识别" in m and "u_lit.o_o" in m
+                   for m in warn_msgs)
+        err_msgs = _error_messages(log_records)
+        assert any("编译诊断" in m and "ERROR" in m for m in err_msgs)
+        assert not any(e.is_port_conn for e in result.dep_edges)
+        assert _sig_keys(result.dep_edges) == {
+            ("portconn_lit_top.y", "portconn_lit_top.d", False, False),
+        }
+        _assert_edges_resolve(result)
