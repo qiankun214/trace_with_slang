@@ -19,6 +19,7 @@ obj_dir/
 *.egg-info/
 dist/
 build/
+.coverage
 
 # IDE
 .vscode/
