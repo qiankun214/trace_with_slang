@@ -15,6 +15,10 @@ __pycache__/
 *.lxt
 obj_dir/
 
+# sqlite database artifacts (build 命令产物)
+*.sqlite
+*.db
+
 # Distribution / packaging
 *.egg-info/
 dist/

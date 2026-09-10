@@ -1,7 +1,7 @@
 ---
 name: trace_with_slang
 description: This skill should be used when developing or refactoring the trace_with_slang project itself — the SystemVerilog trace analysis tool (pyslang parse → sqlite → API). Covers the project's architecture design (4-flow pipeline with strict input/output chaining), the four core features (variable info, assignment blocks, trace load, trace driver), doc structure, and coding conventions. Triggers on phrases like "trace_with_slang", "本项目", "本库", "架构设计", "重构", "开发本项目" or when planning work in src/.
-version: 1.0.8
+version: 1.0.9
 ---
 
 # trace_with_slang — 项目知识与架构设计
@@ -60,6 +60,14 @@ version: 1.0.8
 - **输出**：四大功能结果（见 §1）
 - **功能**：只读查询 sqlite，服务四大需求；查询语义两条定稿规则 —— 端口连接边方向映射（端口连接边按数据流方向存储，查询时与块内边取列相反）与 base↔field 层级合并（匹配行集 = 自身 + 祖先 + 后裔，LIKE 需转义）
 - **一级函数**：`get_variable_info` / `get_assignment_blocks` / `trace_load` / `trace_driver`，均以 `db 路径 + var_path` 为输入（实现于 `src/query.py`，复用 `src/schema.py` 表元数据；行为契约见 `doc/flow4_design_spec.md`）
+
+### 调用方：CLI（✅ 已实现：`src/cli.py`）
+
+- **定位**：架构**外**的调用方（flow4 spec §9：CLI 属调用方职责），仅串联四个流程一级函数，不改流程内部契约；不作为流程 ⑤
+- **子命令**：`build <filelist> [-o DB]`（串联 ①→②→③，默认库 = filelist 同目录同 stem + `.sqlite`）+ 四查询 `info/blocks/load/driver <db> <var> [--json]`（db/var 位置序镜像流程④函数签名）
+- **输出通道**：结果 stdout、loguru 日志 stderr；退出码 0 成功 / 1 已知用户错误 / 2 用法错误；未预期异常直接爆出
+- **实现约定**：argparse 标准库零新依赖；错误文案直接复用库层异常消息，不二次包装；测试见 `tests/test_cli.py`（黑盒断言 stdout/stderr/退出码）
+- **使用说明**：`doc/readme.md`；素材 `test/with_instance/filelist.f`（经典变量 `alu_system.u_core.add_sum`）；生成的 `*.sqlite`/`*.db` 已入 .gitignore
 
 ## 3. 关键语义定义
 
